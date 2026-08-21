@@ -91,6 +91,9 @@ pub struct Document {
     pub(crate) comments_extended_owned: bool,
     /// Normal layout, including system font discovery, computed on first use.
     layout_cache: Mutex<Option<Arc<oxml_layout::LayoutResult>>>,
+    /// Layout engine reused across layouts so its font and shaping caches
+    /// survive document mutations.
+    layout_engine: Mutex<Option<rdocx_layout::engine::Engine>>,
     /// Bundled-font-only layout used by deterministic rendering.
     deterministic_layout_cache: Mutex<Option<Arc<oxml_layout::LayoutResult>>>,
 }
@@ -419,6 +422,7 @@ impl Document {
             comments_owned: false,
             comments_extended_owned: false,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         }
     }
@@ -557,6 +561,7 @@ impl Document {
             comments_owned: false,
             comments_extended_owned: false,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         })
     }
@@ -586,7 +591,14 @@ impl Document {
         let input = self.build_layout_input();
         #[cfg(test)]
         record_layout_invocation();
-        let layout = Arc::new(rdocx_layout::layout_document(&input)?);
+        let layout = {
+            let mut guard = self
+                .layout_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let engine = guard.get_or_insert_with(rdocx_layout::engine::Engine::new);
+            Arc::new(engine.layout(&input)?)
+        };
         *cache = Some(Arc::clone(&layout));
         Ok(layout)
     }
@@ -2600,6 +2612,7 @@ impl Document {
             comments_owned: self.comments_owned,
             comments_extended_owned: self.comments_extended_owned,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         }
     }

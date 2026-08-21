@@ -85,6 +85,12 @@ pub struct FontManager {
     /// has been found for one character it almost always covers the rest of
     /// the run, so it is tried first next time.
     coverage_fallbacks: HashMap<(bool, bool), Vec<usize>>,
+    /// Shaped-run memo: (font id, hash of text+size) -> shaped output.
+    ///
+    /// An edit relayouts the whole document but reshapes mostly unchanged
+    /// runs; memoizing makes reshaping proportional to the edit instead of
+    /// the document. Interior mutability keeps `shape_text(&self)` intact.
+    shape_memo: std::sync::Mutex<HashMap<(u32, u64), ShapedText>>,
     /// Characters already searched for and not found in any available font, so
     /// the scan is not repeated for every occurrence.
     coverage_misses: HashSet<char>,
@@ -133,22 +139,45 @@ impl Default for FontManager {
     }
 }
 
+/// Bundled + system fonts, discovered once per process.
+///
+/// `load_system_fonts()` walks and parses every installed font file, which
+/// costs on the order of a second on a machine with CJK font collections.
+/// Doing that on every `FontManager::new()` made each relayout pay it again;
+/// building the database once and cloning it (face tables only — file-backed
+/// sources stay file-backed) drops it to a per-process cost.
+#[cfg(feature = "system-fonts")]
+fn base_database() -> &'static fontdb::Database {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<fontdb::Database> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        for (_family, data) in crate::bundled_fonts::bundled_font_data() {
+            db.load_font_data(data.to_vec());
+        }
+        db.load_system_fonts();
+        db
+    })
+}
+
 impl FontManager {
     /// Create a new FontManager and load system fonts.
     ///
     /// Bundled fonts (Carlito, Caladea, Liberation) are loaded as fallbacks.
-    /// System fonts are discovered when the `system-fonts` feature is enabled.
+    /// System fonts are discovered when the `system-fonts` feature is enabled,
+    /// once per process (see `base_database`).
     pub fn new() -> Self {
-        let mut db = fontdb::Database::new();
-
-        // Load bundled fonts first (lowest priority fallbacks)
-        for (_family, data) in crate::bundled_fonts::bundled_font_data() {
-            db.load_font_data(data.to_vec());
-        }
-
-        // Then load system fonts when the local feature enables discovery.
         #[cfg(feature = "system-fonts")]
-        db.load_system_fonts();
+        let db = base_database().clone();
+
+        #[cfg(not(feature = "system-fonts"))]
+        let db = {
+            let mut db = fontdb::Database::new();
+            for (_family, data) in crate::bundled_fonts::bundled_font_data() {
+                db.load_font_data(data.to_vec());
+            }
+            db
+        };
 
         FontManager {
             db,
@@ -157,6 +186,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -177,6 +207,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -208,6 +239,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -461,11 +493,43 @@ impl FontManager {
         let font_id = FontId(self.next_id);
         self.next_id += 1;
 
-        // Load the font data
-        let (data, face_index) = self
-            .db
-            .with_face_data(db_id, |data, idx| (Arc::new(data.to_vec()), idx))
-            .ok_or_else(|| LayoutError::FontParse("Failed to load font data".into()))?;
+        // Load the font data. File-backed faces (system fonts) are read from
+        // disk and copied on every access, which large CJK collections turn
+        // into tens of milliseconds per relayout — cache those bytes process-
+        // wide, keyed by path + collection index. In-memory faces (bundled,
+        // user-provided) are already cheap and stay uncached.
+        #[cfg(not(feature = "system-fonts"))]
+        let cached: Option<(Arc<Vec<u8>>, u32)> = None;
+        #[cfg(feature = "system-fonts")]
+        let cached: Option<(Arc<Vec<u8>>, u32)> = {
+            use std::collections::HashMap;
+            use std::path::PathBuf;
+            use std::sync::{Mutex, OnceLock};
+            static FACE_BYTES: OnceLock<Mutex<HashMap<(PathBuf, u32), (Arc<Vec<u8>>, u32)>>> =
+                OnceLock::new();
+            self.db.face(db_id).and_then(|info| match &info.source {
+                fontdb::Source::File(path) => {
+                    let key = (path.clone(), info.index);
+                    let cache = FACE_BYTES.get_or_init(|| Mutex::new(HashMap::new()));
+                    if let Some(hit) = cache.lock().unwrap().get(&key) {
+                        return Some(hit.clone());
+                    }
+                    let loaded = self
+                        .db
+                        .with_face_data(db_id, |data, idx| (Arc::new(data.to_vec()), idx))?;
+                    cache.lock().unwrap().insert(key, loaded.clone());
+                    Some(loaded)
+                }
+                _ => None,
+            })
+        };
+        let (data, face_index) = match cached {
+            Some(hit) => hit,
+            None => self
+                .db
+                .with_face_data(db_id, |data, idx| (Arc::new(data.to_vec()), idx))
+                .ok_or_else(|| LayoutError::FontParse("Failed to load font data".into()))?,
+        };
 
         let (units_per_em, ascender, descender, line_gap) = {
             let face = ttf_parser::Face::parse(&data, face_index)
@@ -547,6 +611,27 @@ impl FontManager {
             });
         }
 
+        let memo_key = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for b in text.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            for b in size_pt.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (font_id.0, h)
+        };
+        if let Some(hit) = self
+            .shape_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&memo_key)
+        {
+            return Ok(hit.clone());
+        }
+
         let font = self.get_font(font_id)?;
 
         let face = harfrust::FontRef::from_index(&font.data, font.face_index)
@@ -578,11 +663,20 @@ impl FontManager {
             total_width += advance;
         }
 
-        Ok(ShapedText {
+        let shaped = ShapedText {
             glyph_ids,
             advances,
             width: total_width,
-        })
+        };
+        let mut memo = self
+            .shape_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memo.len() >= 200_000 {
+            memo.clear();
+        }
+        memo.insert(memo_key, shaped.clone());
+        Ok(shaped)
     }
 
     /// Get font data for PDF embedding.
