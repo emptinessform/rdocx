@@ -2968,6 +2968,28 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: expose the full cached layout, fonts included, so an
+    /// external renderer can consume positioned pages plus glyph font bytes.
+    pub fn layout(&self) -> Result<Arc<oxml_layout::LayoutResult>> {
+        self.cached_layout()
+    }
+
+    /// SVG PoC patch: like `layout()` but with caller-provided fonts, for
+    /// wasm builds where system font discovery is unavailable. Uncached.
+    pub fn layout_with_fonts(
+        &self,
+        font_files: &[(&str, &[u8])],
+    ) -> Result<oxml_layout::LayoutResult> {
+        let mut input = self.build_layout_input();
+        for (family, data) in font_files {
+            input.fonts.push(rdocx_layout::FontFile {
+                family: family.to_string(),
+                data: data.to_vec(),
+            });
+        }
+        rdocx_layout::layout_document(&input).map_err(Into::into)
+    }
+
     /// Render the document to PDF bytes with the selected revision view.
     pub fn to_pdf_with_options(&self, options: RenderOptions) -> Result<Vec<u8>> {
         let layout = self.layout_with_options(options, false)?;
