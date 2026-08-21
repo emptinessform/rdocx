@@ -685,7 +685,7 @@ impl FontManager {
         Ok(crate::output::FontData {
             id: font.id,
             family: font.family.clone(),
-            data: (*font.data).clone(),
+            data: font.data.clone(),
             face_index: font.face_index,
             bold: font.bold,
             italic: font.italic,
@@ -699,7 +699,7 @@ impl FontManager {
             .map(|f| crate::output::FontData {
                 id: f.id,
                 family: f.family.clone(),
-                data: (*f.data).clone(),
+                data: f.data.clone(),
                 face_index: f.face_index,
                 bold: f.bold,
                 italic: f.italic,

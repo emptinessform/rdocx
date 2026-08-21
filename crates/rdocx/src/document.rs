@@ -609,6 +609,25 @@ impl Document {
         Ok(layout)
     }
 
+    /// SVG PoC patch: detach the persistent layout engine, e.g. to hand it
+    /// to the Document that replaces this one after an undo snapshot
+    /// restore. Caches are content-keyed, so they stay valid across
+    /// documents.
+    pub fn take_layout_engine(&self) -> Option<rdocx_layout::engine::Engine> {
+        self.layout_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// SVG PoC patch: adopt a layout engine detached from another document.
+    pub fn set_layout_engine(&self, engine: rdocx_layout::engine::Engine) {
+        *self
+            .layout_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine);
+    }
+
     /// SVG PoC patch: run layout through the document's persistent engine.
     fn engine_layout(&self, input: &rdocx_layout::LayoutInput) -> Result<oxml_layout::LayoutResult> {
         let mut guard = self

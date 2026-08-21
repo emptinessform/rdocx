@@ -333,20 +333,12 @@ impl Engine {
                         .unwrap_or(&final_sect_pr);
                     let geometry = sect_pr_to_geometry(sect_pr_for_layout);
 
-                    let cache_key = {
-                        let mut h = 0xcbf2_9ce4_8422_2325u64;
-                        let mut eat = |bytes: &[u8]| {
-                            for b in bytes {
-                                h ^= u64::from(*b);
-                                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                            }
-                        };
-                        eat(format!("{para:?}").as_bytes());
-                        eat(&geometry.content_width().to_bits().to_le_bytes());
-                        eat(&[input.revision_view as u8]);
-                        eat(&self.fonts_fingerprint.to_le_bytes());
-                        h
-                    };
+                    let cache_key = fingerprint_paragraph(
+                        para,
+                        geometry.content_width(),
+                        input.revision_view as u8,
+                        self.fonts_fingerprint,
+                    );
                     let mut para_block = if let Some(hit) = self.block_cache.get(&cache_key) {
                         hit.clone()
                     } else {
@@ -483,6 +475,8 @@ impl Engine {
             );
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_post = std::time::Instant::now();
         // Endnotes read at the end of the document, so they follow the last
         // body page rather than sitting at the foot of their reference's page.
         paginator::append_endnote_pages(&mut pages, &notes, final_geometry);
@@ -517,8 +511,19 @@ impl Engine {
         // Post-pagination pass: apply page background color
         apply_page_background(&mut pages, input);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let post_ms = t_post.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_fonts = std::time::Instant::now();
         // Collect font data
         let fonts = self.font_manager.all_font_data();
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var("RDOCX_TIMING").is_ok() {
+            eprintln!(
+                "timing: post {post_ms:.0} ms, font_data {:.0} ms",
+                t_fonts.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         // Convert core properties to document metadata
         let metadata = input.core_properties.as_ref().map(|cp| DocumentMetadata {
@@ -4636,4 +4641,80 @@ mod tests {
         assert!(text.iter().any(|value| value == "2"), "{text:?}");
         assert!(!text.iter().any(|value| value == "cached"), "{text:?}");
     }
+}
+
+/// Fast content fingerprint of a paragraph for the block cache.
+///
+/// Run text is hashed as raw bytes (the hot path: most of a document is
+/// plain text runs); everything else that can influence layout — paragraph
+/// and run properties, non-text run content, hyperlink/comment/bookmark/
+/// control/revision projections — is folded in via its Debug form, which is
+/// cheap because those structures are small or usually empty. If CT_P grows
+/// a new layout-relevant field this walker must learn it; the tradeoff over
+/// hashing `format!("{para:?}")` wholesale is ~20ms per relayout on a
+/// 63-page document.
+fn fingerprint_paragraph(
+    para: &rdocx_oxml::text::CT_P,
+    content_width: f64,
+    revision_view: u8,
+    fonts_fingerprint: u64,
+) -> u64 {
+    use rdocx_oxml::text::RunContent;
+    use std::fmt::Write as _;
+
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let mut small = String::new();
+    let _ = write!(small, "{:?}", para.properties);
+    eat(small.as_bytes());
+    for run in &para.runs {
+        eat(b"r");
+        small.clear();
+        let _ = write!(small, "{:?}", run.properties);
+        eat(small.as_bytes());
+        for content in &run.content {
+            match content {
+                RunContent::Text(t) => {
+                    eat(b"t");
+                    eat(t.text.as_bytes());
+                    eat(&[u8::from(t.preserve_space)]);
+                }
+                other => {
+                    eat(b"o");
+                    small.clear();
+                    let _ = write!(small, "{other:?}");
+                    eat(small.as_bytes());
+                }
+            }
+        }
+    }
+    if !(para.hyperlinks.is_empty()
+        && para.comment_ranges.is_empty()
+        && para.bookmark_markers.is_empty()
+        && para.extra_xml.is_empty()
+        && para.content_controls.is_empty()
+        && para.revisions.is_empty())
+    {
+        small.clear();
+        let _ = write!(
+            small,
+            "{:?}{:?}{:?}{:?}{:?}{:?}",
+            para.hyperlinks,
+            para.comment_ranges,
+            para.bookmark_markers,
+            para.extra_xml,
+            para.content_controls,
+            para.revisions
+        );
+        eat(small.as_bytes());
+    }
+    eat(&content_width.to_bits().to_le_bytes());
+    eat(&[revision_view]);
+    eat(&fonts_fingerprint.to_le_bytes());
+    h
 }
