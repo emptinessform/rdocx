@@ -85,6 +85,12 @@ pub struct FontManager {
     /// has been found for one character it almost always covers the rest of
     /// the run, so it is tried first next time.
     coverage_fallbacks: HashMap<(bool, bool), Vec<usize>>,
+    /// Shaped-run memo: (font id, hash of text+size) -> shaped output.
+    ///
+    /// An edit relayouts the whole document but reshapes mostly unchanged
+    /// runs; memoizing makes reshaping proportional to the edit instead of
+    /// the document. Interior mutability keeps `shape_text(&self)` intact.
+    shape_memo: std::sync::Mutex<HashMap<(u32, u64), ShapedText>>,
     /// Characters already searched for and not found in any available font, so
     /// the scan is not repeated for every occurrence.
     coverage_misses: HashSet<char>,
@@ -180,6 +186,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -200,6 +207,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -231,6 +239,7 @@ impl FontManager {
             next_id: 0,
             coverage_fallbacks: HashMap::new(),
             coverage_misses: HashSet::new(),
+            shape_memo: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -602,6 +611,27 @@ impl FontManager {
             });
         }
 
+        let memo_key = {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for b in text.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            for b in size_pt.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (font_id.0, h)
+        };
+        if let Some(hit) = self
+            .shape_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&memo_key)
+        {
+            return Ok(hit.clone());
+        }
+
         let font = self.get_font(font_id)?;
 
         let face = harfrust::FontRef::from_index(&font.data, font.face_index)
@@ -633,11 +663,20 @@ impl FontManager {
             total_width += advance;
         }
 
-        Ok(ShapedText {
+        let shaped = ShapedText {
             glyph_ids,
             advances,
             width: total_width,
-        })
+        };
+        let mut memo = self
+            .shape_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memo.len() >= 200_000 {
+            memo.clear();
+        }
+        memo.insert(memo_key, shaped.clone());
+        Ok(shaped)
     }
 
     /// Get font data for PDF embedding.

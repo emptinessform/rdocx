@@ -91,6 +91,9 @@ pub struct Document {
     pub(crate) comments_extended_owned: bool,
     /// Normal layout, including system font discovery, computed on first use.
     layout_cache: Mutex<Option<Arc<oxml_layout::LayoutResult>>>,
+    /// SVG PoC patch: layout engine reused across layouts so its font and
+    /// shaping caches survive edits.
+    layout_engine: Mutex<Option<rdocx_layout::engine::Engine>>,
     /// Bundled-font-only layout used by deterministic rendering.
     deterministic_layout_cache: Mutex<Option<Arc<oxml_layout::LayoutResult>>>,
 }
@@ -419,6 +422,7 @@ impl Document {
             comments_owned: false,
             comments_extended_owned: false,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         }
     }
@@ -557,6 +561,7 @@ impl Document {
             comments_owned: false,
             comments_extended_owned: false,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         })
     }
@@ -583,12 +588,31 @@ impl Document {
             return Ok(Arc::clone(layout));
         }
 
+        let t0 = std::time::Instant::now();
         let input = self.build_layout_input();
+        let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         #[cfg(test)]
         record_layout_invocation();
-        let layout = Arc::new(rdocx_layout::layout_document(&input)?);
+        let t1 = std::time::Instant::now();
+        let layout = Arc::new(self.engine_layout(&input)?);
+        if std::env::var("RDOCX_TIMING").is_ok() {
+            eprintln!(
+                "timing: build_input {build_ms:.0} ms, engine.layout {:.0} ms",
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         *cache = Some(Arc::clone(&layout));
         Ok(layout)
+    }
+
+    /// SVG PoC patch: run layout through the document's persistent engine.
+    fn engine_layout(&self, input: &rdocx_layout::LayoutInput) -> Result<oxml_layout::LayoutResult> {
+        let mut guard = self
+            .layout_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let engine = guard.get_or_insert_with(rdocx_layout::engine::Engine::new);
+        engine.layout(input).map_err(Into::into)
     }
 
     /// Return the bundled-font-only layout, computing it once after mutation.
@@ -2600,6 +2624,7 @@ impl Document {
             comments_owned: self.comments_owned,
             comments_extended_owned: self.comments_extended_owned,
             layout_cache: Mutex::new(None),
+            layout_engine: Mutex::new(None),
             deterministic_layout_cache: Mutex::new(None),
         }
     }
@@ -3008,7 +3033,7 @@ impl Document {
                 data: data.to_vec(),
             });
         }
-        rdocx_layout::layout_document(&input).map_err(Into::into)
+        self.engine_layout(&input)
     }
 
     /// Render the document to PDF bytes with the selected revision view.

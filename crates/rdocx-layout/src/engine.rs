@@ -240,6 +240,15 @@ fn revision_is_visible(revision: &CT_Revision) -> bool {
 /// The layout engine.
 pub struct Engine {
     font_manager: FontManager,
+    /// Fingerprint of the additional fonts already loaded, so a reused
+    /// engine does not reload identical user/DOCX fonts every layout.
+    fonts_fingerprint: u64,
+    /// Laid-out paragraph blocks from previous layouts, keyed by a
+    /// fingerprint of the paragraph XML, content width, revision view, and
+    /// font set. Only marker-less paragraphs are cached, so numbering state
+    /// still advances through every numbered paragraph. An edit therefore
+    /// relays out only the paragraphs it touched.
+    block_cache: std::collections::HashMap<u64, ParagraphBlock>,
 }
 
 impl Default for Engine {
@@ -252,6 +261,8 @@ impl Engine {
     pub fn new() -> Self {
         Engine {
             font_manager: FontManager::new(),
+            fonts_fingerprint: 0,
+            block_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -259,14 +270,29 @@ impl Engine {
     pub fn new_deterministic() -> Result<Self> {
         Ok(Engine {
             font_manager: FontManager::new_deterministic()?,
+            fonts_fingerprint: 0,
+            block_cache: std::collections::HashMap::new(),
         })
     }
 
     /// Lay out the entire document.
     pub fn layout(&mut self, input: &LayoutInput) -> Result<LayoutResult> {
-        // Load user-provided / DOCX-embedded fonts (highest priority)
+        // Load user-provided / DOCX-embedded fonts (highest priority) —
+        // once per distinct font set when the engine is reused.
         if !input.fonts.is_empty() {
-            self.font_manager.load_additional_fonts(&input.fonts);
+            let mut fp = 0xcbf2_9ce4_8422_2325u64;
+            for f in &input.fonts {
+                for b in f.family.as_bytes() {
+                    fp ^= u64::from(*b);
+                    fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                fp ^= f.data.len() as u64;
+                fp = fp.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            if fp != self.fonts_fingerprint {
+                self.font_manager.load_additional_fonts(&input.fonts);
+                self.fonts_fingerprint = fp;
+            }
         }
 
         let styles = &input.styles;
@@ -288,6 +314,7 @@ impl Engine {
             .cloned()
             .unwrap_or_else(CT_SectPr::default_letter);
 
+        let t_blocks = std::time::Instant::now();
         // Build sections: each section has blocks + geometry + header/footer
         let mut sections: Vec<paginator::Section> = Vec::new();
         let mut current_blocks: Vec<LayoutBlock> = Vec::new();
@@ -305,16 +332,46 @@ impl Engine {
                         .unwrap_or(&final_sect_pr);
                     let geometry = sect_pr_to_geometry(sect_pr_for_layout);
 
-                    let mut para_block = layout_paragraph(
-                        para,
-                        geometry.content_width(),
-                        styles,
-                        input,
-                        &media,
-                        &mut self.font_manager,
-                        &mut num_state,
-                        &mut diagnostics,
-                    )?;
+                    let cache_key = {
+                        let mut h = 0xcbf2_9ce4_8422_2325u64;
+                        let mut eat = |bytes: &[u8]| {
+                            for b in bytes {
+                                h ^= u64::from(*b);
+                                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                            }
+                        };
+                        eat(format!("{para:?}").as_bytes());
+                        eat(&geometry.content_width().to_bits().to_le_bytes());
+                        eat(&[input.revision_view as u8]);
+                        eat(&self.fonts_fingerprint.to_le_bytes());
+                        h
+                    };
+                    let mut para_block = if let Some(hit) = self.block_cache.get(&cache_key) {
+                        hit.clone()
+                    } else {
+                        let block = layout_paragraph(
+                            para,
+                            geometry.content_width(),
+                            styles,
+                            input,
+                            &media,
+                            &mut self.font_manager,
+                            &mut num_state,
+                            &mut diagnostics,
+                        )?;
+                        let has_marker = block.lines.iter().any(|line| {
+                            line.items
+                                .iter()
+                                .any(|item| matches!(item, oxml_layout::LineItem::Marker(_)))
+                        });
+                        if !has_marker {
+                            if self.block_cache.len() >= 20_000 {
+                                self.block_cache.clear();
+                            }
+                            self.block_cache.insert(cache_key, block.clone());
+                        }
+                        block
+                    };
 
                     if !document_wraps {
                         para_block.reflow = None;
@@ -410,9 +467,17 @@ impl Engine {
             &mut diagnostics,
         )?;
 
+        let blocks_ms = t_blocks.elapsed().as_secs_f64() * 1000.0;
+        let t_pag = std::time::Instant::now();
         // Paginate across all sections
         let (mut pages, outlines) =
             paginator::paginate_sections(&sections, &self.font_manager, &media, &notes);
+        if std::env::var("RDOCX_TIMING").is_ok() {
+            eprintln!(
+                "timing: blocks {blocks_ms:.0} ms, paginate {:.0} ms",
+                t_pag.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         // Endnotes read at the end of the document, so they follow the last
         // body page rather than sitting at the foot of their reference's page.
