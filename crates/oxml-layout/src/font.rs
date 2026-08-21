@@ -489,6 +489,9 @@ impl FontManager {
         // into tens of milliseconds per relayout — cache those bytes process-
         // wide, keyed by path + collection index. In-memory faces (bundled,
         // user-provided) are already cheap and stay uncached.
+        #[cfg(not(feature = "system-fonts"))]
+        let cached: Option<(Arc<Vec<u8>>, u32)> = None;
+        #[cfg(feature = "system-fonts")]
         let cached: Option<(Arc<Vec<u8>>, u32)> = {
             use std::collections::HashMap;
             use std::path::PathBuf;
