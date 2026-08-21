@@ -5,6 +5,7 @@
 
 use crate::block::{AnchoredContent, AnchoredDrawing, LayoutBlock, ParagraphBlock, ShapePreset};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use oxml_layout::{
     Align, Color, FontManager, GlyphRun, LayoutLine, LineItem, MediaId, NoteRef, NoteStream,
@@ -113,11 +114,11 @@ pub fn paginate_sections(
     fm: &FontManager,
     media: &MediaRegistry,
     notes: &NoteRegistry,
-) -> (Vec<PageFrame>, Vec<OutlineEntry>) {
+) -> (Vec<Arc<PageFrame>>, Vec<OutlineEntry>) {
     let media = media.media();
     if sections.is_empty() {
         return (
-            vec![PageFrame::new(1, 612.0, 792.0, Vec::new())],
+            vec![Arc::new(PageFrame::new(1, 612.0, 792.0, Vec::new()))],
             Vec::new(),
         );
     }
@@ -154,7 +155,7 @@ pub fn paginate_sections(
 
         // Adjust page numbers and outline page indices
         for page in &mut pages {
-            page.page_number += page_offset;
+            Arc::make_mut(page).page_number += page_offset;
         }
         for outline in &mut outlines {
             outline.page_index += page_offset;
@@ -168,10 +169,267 @@ pub fn paginate_sections(
     // If a section produced no pages (empty blocks), we might have duplicates
     // Renumber pages sequentially
     for (i, page) in all_pages.iter_mut().enumerate() {
-        page.page_number = i + 1;
+        Arc::make_mut(page).page_number = i + 1;
     }
 
     (all_pages, all_outlines)
+}
+
+/// A page boundary a later run can resume from: block `block_idx` opened a
+/// fresh page after `pages_done` finished pages, and the pager carried no
+/// state across the boundary (no split paragraph, no footnote continuation,
+/// no floats). At such a point the whole pager state is those two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    block_idx: usize,
+    pages_done: usize,
+}
+
+/// Lookup for stopping a resumed pass early. Boundaries are keyed by how many
+/// blocks REMAIN after them (an end offset survives insertions and deletions
+/// earlier in the document, a block index does not); the value is how many
+/// pages the previous run had finished at that boundary. A resumed pass that
+/// reaches a clean page start whose end offset lies inside the unchanged tail
+/// and whose page count matches can adopt the old pages from there on.
+struct SpliceMap {
+    total_blocks: usize,
+    /// Blocks from `total_blocks - max_suffix` on are identical to the old run.
+    max_suffix: usize,
+    by_end_offset: HashMap<usize, usize>,
+}
+
+/// The previous relayout's pagination of a single-section document, pristine:
+/// pages here predate endnote append, field substitution and page background,
+/// so the engine's post-passes treat reused pages exactly like fresh ones.
+///
+/// Owned by whoever calls [`paginate_sections_cached`] across relayouts
+/// (in practice the layout engine).
+pub struct PaginationCache {
+    /// Everything outside the block stream that pagination reads: geometry,
+    /// header/footer sources, note definitions, fonts, revision view. Any
+    /// change invalidates the whole cache.
+    env_fp: u64,
+    /// One fingerprint per block; equality means "paginates identically".
+    block_fps: Vec<u64>,
+    pages: Vec<Arc<PageFrame>>,
+    outlines: Vec<OutlineEntry>,
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// [`paginate_sections`] with page reuse across relayouts.
+///
+/// On a cache hit only the pages around the first changed block are rebuilt:
+/// pages before the last checkpoint preceding the change are taken from the
+/// cache, and when the document's tail is unchanged and lands on the same
+/// page number as before, the old tail pages are spliced back in — a typing
+/// edit inside one paragraph repaginates one or two pages instead of all.
+///
+/// Reuse is refused (falling back to a full run, clearing the cache) whenever
+/// it could change output: multiple sections (their pagination renumbers
+/// pages globally), any floating drawing (the look-ahead lets a later block
+/// place a drawing on an earlier page, and paragraph-relative wraps need two
+/// passes), a changed environment, or no usable checkpoint. `block_fps` is
+/// one fingerprint per block of the single section; pass `None` when the
+/// caller cannot vouch for the blocks and a plain full run is wanted.
+pub fn paginate_sections_cached(
+    sections: &[Section],
+    fm: &FontManager,
+    media: &MediaRegistry,
+    notes: &NoteRegistry,
+    block_fps: Option<&[u64]>,
+    env_fp: u64,
+    cache: &mut Option<PaginationCache>,
+) -> (Vec<Arc<PageFrame>>, Vec<OutlineEntry>) {
+    let cacheable = sections.len() == 1
+        && block_fps.is_some_and(|fps| fps.len() == sections[0].blocks.len())
+        && !sections[0].blocks.iter().any(|block| match block {
+            LayoutBlock::Paragraph(para) => !para.anchored.is_empty(),
+            LayoutBlock::Table(_) => false,
+        });
+    if !cacheable {
+        *cache = None;
+        return paginate_sections(sections, fm, media, notes);
+    }
+    let section = &sections[0];
+    let fps = block_fps.expect("checked by cacheable");
+    let context = PassContext {
+        geometry: section.geometry,
+        header_footer: section.header_footer.as_ref(),
+        title_pg: section.title_pg,
+        fm,
+        media: media.media(),
+        notes,
+    };
+
+    // No floating drawings (checked above) means the single pass is exact,
+    // so the two-pass logic of `paginate_with_media` is not needed here.
+    let full = |cache: &mut Option<PaginationCache>| {
+        let result =
+            paginate_pass_resumable(&section.blocks, &context, &ResolvedWraps::new(), 0, 1, None);
+        let built = PaginationCache {
+            env_fp,
+            block_fps: fps.to_vec(),
+            pages: result.pages,
+            outlines: result.outlines,
+            checkpoints: result.checkpoints,
+        };
+        let out = (built.pages.clone(), built.outlines.clone());
+        *cache = Some(built);
+        out
+    };
+
+    let old = match cache.take() {
+        Some(c) if c.env_fp == env_fp => c,
+        other => {
+            #[cfg(not(target_arch = "wasm32"))]
+            if std::env::var("RDOCX_TIMING").is_ok() {
+                eprintln!(
+                    "timing: pagination cache miss ({})",
+                    if other.is_none() {
+                        "cold"
+                    } else {
+                        "env changed"
+                    }
+                );
+            }
+            let _ = other;
+            return full(cache);
+        }
+    };
+
+    let new_len = fps.len();
+    let old_len = old.block_fps.len();
+    let prefix = fps
+        .iter()
+        .zip(&old.block_fps)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if prefix == new_len && prefix == old_len {
+        let out = (old.pages.clone(), old.outlines.clone());
+        *cache = Some(old);
+        return out;
+    }
+    // Longest identical tail, clamped so it cannot reach into the changed
+    // region on either side.
+    let max_suffix = fps
+        .iter()
+        .rev()
+        .zip(old.block_fps.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(new_len - prefix)
+        .min(old_len - prefix);
+
+    // Resume from the last boundary strictly before the first changed block:
+    // the page before a boundary was decided with a one-block look-ahead
+    // (keep-with-next peeks the boundary block's first line), so the
+    // boundary block itself must be unchanged too.
+    let Some(resume) = old
+        .checkpoints
+        .iter()
+        .rev()
+        .copied()
+        .find(|c| c.block_idx < prefix && c.pages_done > 0)
+    else {
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var("RDOCX_TIMING").is_ok() {
+            eprintln!(
+                "timing: pagination cache unusable (change at block {prefix}, no earlier checkpoint)"
+            );
+        }
+        return full(cache);
+    };
+
+    let splice_map = SpliceMap {
+        total_blocks: new_len,
+        max_suffix,
+        by_end_offset: old
+            .checkpoints
+            .iter()
+            .filter(|c| c.block_idx + max_suffix >= old_len && c.pages_done > 0)
+            .map(|c| (old_len - c.block_idx, c.pages_done))
+            .collect(),
+    };
+    let mid = paginate_pass_resumable(
+        &section.blocks,
+        &context,
+        &ResolvedWraps::new(),
+        resume.block_idx,
+        resume.pages_done + 1,
+        Some(&splice_map),
+    );
+
+    // Reassemble, moving the reused old pages rather than cloning them.
+    let mut pages = old.pages;
+    let old_outlines = old.outlines;
+    let mut checkpoints: Vec<Checkpoint> = old
+        .checkpoints
+        .iter()
+        .copied()
+        .filter(|c| c.block_idx < resume.block_idx)
+        .collect();
+    let (suffix_pages, suffix_outlines, suffix_cps) = if let Some(sp) = mid.spliced_at {
+        let old_splice_block = old_len - (new_len - sp.block_idx);
+        let tail_pages = pages.split_off(sp.pages_done);
+        let tail_outlines: Vec<OutlineEntry> = old_outlines
+            .iter()
+            .filter(|o| o.page_index >= sp.pages_done)
+            .cloned()
+            .collect();
+        let shift = new_len as isize - old_len as isize;
+        let tail_cps: Vec<Checkpoint> = old
+            .checkpoints
+            .iter()
+            .filter(|c| c.block_idx > old_splice_block)
+            .map(|c| Checkpoint {
+                block_idx: (c.block_idx as isize + shift) as usize,
+                pages_done: c.pages_done,
+            })
+            .collect();
+        (tail_pages, tail_outlines, tail_cps)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    pages.truncate(resume.pages_done);
+    let mut outlines: Vec<OutlineEntry> = old_outlines
+        .into_iter()
+        .filter(|o| o.page_index < resume.pages_done)
+        .collect();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var("RDOCX_TIMING").is_ok() {
+        eprintln!(
+            "timing: pagination reuse — {} prefix + {} rebuilt + {} spliced pages",
+            pages.len(),
+            mid.pages.len(),
+            suffix_pages.len()
+        );
+    }
+
+    pages.extend(mid.pages);
+    pages.extend(suffix_pages);
+    outlines.extend(mid.outlines);
+    outlines.extend(suffix_outlines);
+    checkpoints.extend(mid.checkpoints);
+    checkpoints.extend(suffix_cps);
+    debug_assert!(
+        pages
+            .iter()
+            .enumerate()
+            .all(|(i, p)| p.page_number == i + 1),
+        "reassembled pages must stay sequentially numbered"
+    );
+
+    let built = PaginationCache {
+        env_fp,
+        block_fps: fps.to_vec(),
+        pages,
+        outlines,
+        checkpoints,
+    };
+    let out = (built.pages.clone(), built.outlines.clone());
+    *cache = Some(built);
+    out
 }
 
 /// Paginate a sequence of blocks into pages.
@@ -183,7 +441,7 @@ pub fn paginate(
     _fm: &FontManager,
     media: &MediaRegistry,
     notes: &NoteRegistry,
-) -> (Vec<PageFrame>, Vec<OutlineEntry>) {
+) -> (Vec<Arc<PageFrame>>, Vec<OutlineEntry>) {
     paginate_with_media(
         blocks,
         geometry,
@@ -232,7 +490,7 @@ fn paginate_with_media(
     _fm: &FontManager,
     media: &HashMap<MediaId, ImageData>,
     notes: &NoteRegistry,
-) -> (Vec<PageFrame>, Vec<OutlineEntry>) {
+) -> (Vec<Arc<PageFrame>>, Vec<OutlineEntry>) {
     let context = PassContext {
         geometry,
         header_footer,
@@ -262,9 +520,15 @@ fn paginate_with_media(
 
 /// One pagination pass, and what it learned about paragraph-relative wraps.
 struct PassResult {
-    pages: Vec<PageFrame>,
+    pages: Vec<Arc<PageFrame>>,
     outlines: Vec<OutlineEntry>,
     resolved: ResolvedWraps,
+    /// Page boundaries where a block started cleanly, for `PaginationCache`.
+    checkpoints: Vec<Checkpoint>,
+    /// When the pass stopped early because the rest of the document matched
+    /// the previous run: the number of pages the old run had finished at the
+    /// matching boundary (equal to this pass's own count, by construction).
+    spliced_at: Option<Checkpoint>,
 }
 
 /// Everything a pass needs that is the same for both passes.
@@ -285,6 +549,25 @@ fn paginate_pass(
     context: &PassContext,
     resolved_in: &ResolvedWraps,
 ) -> PassResult {
+    paginate_pass_resumable(blocks, context, resolved_in, 0, 1, None)
+}
+
+/// The pagination loop, generalized so a run can start mid-document.
+///
+/// `start_block`/`start_page_number` seed the pager as if the blocks before
+/// `start_block` had already filled `start_page_number - 1` pages and the
+/// last of them ended exactly at the page boundary (which is what a
+/// [`Checkpoint`] certifies). `splice` optionally lets the pass stop early
+/// when the rest of the document is known to paginate identically to the
+/// previous run; see [`PaginationCache`].
+fn paginate_pass_resumable(
+    blocks: &[LayoutBlock],
+    context: &PassContext,
+    resolved_in: &ResolvedWraps,
+    start_block: usize,
+    start_page_number: usize,
+    splice: Option<&SpliceMap>,
+) -> PassResult {
     let geometry = context.geometry;
     let mut pager = Pager::new(
         geometry,
@@ -295,8 +578,20 @@ fn paginate_pass(
         context.fm,
         resolved_in,
     );
+    pager.page_number = start_page_number;
+    pager.is_first_page = start_page_number == 1;
+    pager.splice = splice;
 
-    for (block_idx, block) in blocks.iter().enumerate() {
+    'blocks: for (block_idx, block) in blocks.iter().enumerate().skip(start_block) {
+        if pager.block_boundary(block_idx) {
+            break 'blocks;
+        }
+        // A block that moves to a fresh page inside its own placement code
+        // (paragraph that does not fit, page-break-before) reaches another
+        // boundary there; those call sites run `block_boundary` themselves.
+        // When one of them flags a splice the block was not placed, so undo
+        // its loop-top bookkeeping (the heading outline entry).
+        let outline_mark = pager.outlines.len();
         // Check for page break before
         if block.page_break_before() && pager.has_content() {
             pager.finish_page();
@@ -316,6 +611,11 @@ fn paginate_pass(
                 paginate_paragraph(para, block_idx, blocks, &mut pager);
             }
             LayoutBlock::Table(table) => {
+                // A page-break-before above may have opened a fresh page
+                // after the loop-top boundary check ran.
+                if pager.block_boundary(block_idx) {
+                    break 'blocks;
+                }
                 let table_x = geometry.margin_left + table.table_indent;
                 let tbl_borders = table.borders.as_ref();
 
@@ -361,20 +661,37 @@ fn paginate_pass(
                 }
             }
         }
+        if pager.splice_hit.is_some() {
+            pager.outlines.truncate(outline_mark);
+            break 'blocks;
+        }
     }
 
     let resolved = std::mem::take(&mut pager.resolved_out);
-    let (pages, outlines) = pager.flush();
+    let checkpoints = std::mem::take(&mut pager.checkpoints);
+    let spliced_at = pager.splice_hit;
+    let (pages, outlines) = if spliced_at.is_some() {
+        // The current page is clean by the splice condition; the old suffix
+        // pages the caller re-attaches include the document's final page, so
+        // there is nothing to flush.
+        (pager.pages, pager.outlines)
+    } else {
+        // Only a run that owns the whole document guarantees "at least one
+        // page"; a resumed run may legitimately add none.
+        pager.flush(start_block == 0)
+    };
     PassResult {
         pages,
         outlines,
         resolved,
+        checkpoints,
+        spliced_at,
     }
 }
 
 /// Helper struct to track page state during pagination.
 struct Pager<'a> {
-    pages: Vec<PageFrame>,
+    pages: Vec<Arc<PageFrame>>,
     elements: Vec<PositionedElement>,
     /// Anchored drawings marked behindDoc. Held apart from the normal element
     /// list so they can be emitted before everything else on the page, which
@@ -419,6 +736,15 @@ struct Pager<'a> {
     resolved_in: &'a ResolvedWraps,
     /// Where this pass is placing them, for the pass that follows.
     resolved_out: ResolvedWraps,
+    /// Page boundaries where a block started on a fresh page with no carried
+    /// state, recorded as the pass runs. See [`Checkpoint`].
+    checkpoints: Vec<Checkpoint>,
+    /// When set, `block_boundary` may stop the pass at a boundary the
+    /// previous run also reached. See [`SpliceMap`].
+    splice: Option<&'a SpliceMap>,
+    /// Set by `block_boundary` when the splice condition fired; the pass
+    /// unwinds without placing the boundary block.
+    splice_hit: Option<Checkpoint>,
 }
 
 impl<'a> Pager<'a> {
@@ -453,11 +779,62 @@ impl<'a> Pager<'a> {
             ink_bottom: 0.0,
             resolved_in,
             resolved_out: ResolvedWraps::new(),
+            checkpoints: Vec::new(),
+            splice: None,
+            splice_hit: None,
         }
     }
 
     fn has_content(&self) -> bool {
         self.has_content_flag
+    }
+
+    /// Whether the pager sits exactly at the top of a fresh page with nothing
+    /// carried over: no placed elements, no floats, no footnote lines waiting
+    /// to continue. At such a point the pager's whole state is captured by
+    /// (next block index, pages finished), which is what makes a
+    /// [`Checkpoint`] sufficient to resume from.
+    fn at_clean_page_start(&self) -> bool {
+        !self.has_content_flag
+            && self.elements.is_empty()
+            && self.behind_elements.is_empty()
+            && self.cursor_y == 0.0
+            && self.page_wraps.is_empty()
+            && self.page_note_ids.is_empty()
+            && self.pending_notes.is_empty()
+            && self.ink_bottom == 0.0
+    }
+
+    /// Called wherever a block is about to be placed: the pass loop top, a
+    /// paragraph's placement entry (which is reached again on a fresh page
+    /// when the paragraph moves there whole), and the table arm. Records a
+    /// checkpoint when the pager sits at a clean page start, and returns
+    /// `true` — stop paginating, the block was NOT placed — when the splice
+    /// map certifies the rest of the document paginates as it did before.
+    fn block_boundary(&mut self, block_idx: usize) -> bool {
+        if !self.at_clean_page_start() {
+            return false;
+        }
+        let cp = Checkpoint {
+            block_idx,
+            pages_done: self.page_number - 1,
+        };
+        if self.checkpoints.last() == Some(&cp) {
+            // The loop top already handled this boundary.
+            return false;
+        }
+        self.checkpoints.push(cp);
+        if let Some(map) = self.splice {
+            let end_offset = map.total_blocks - block_idx;
+            if cp.pages_done > 0
+                && end_offset <= map.max_suffix
+                && map.by_end_offset.get(&end_offset) == Some(&cp.pages_done)
+            {
+                self.splice_hit = Some(cp);
+                return true;
+            }
+        }
+        false
     }
 
     /// Height the note area needs for a given set of notes, in full.
@@ -941,12 +1318,12 @@ impl<'a> Pager<'a> {
             }
         }
 
-        self.pages.push(PageFrame::new(
+        self.pages.push(Arc::new(PageFrame::new(
             self.page_number,
             self.geometry.page_width,
             self.geometry.page_height,
             all_elements,
-        ));
+        )));
         self.page_number += 1;
         self.cursor_y = 0.0;
         self.page_wraps.clear();
@@ -955,9 +1332,9 @@ impl<'a> Pager<'a> {
         self.is_first_page = false;
     }
 
-    fn flush(mut self) -> (Vec<PageFrame>, Vec<OutlineEntry>) {
+    fn flush(mut self, ensure_page: bool) -> (Vec<Arc<PageFrame>>, Vec<OutlineEntry>) {
         // Always create at least one page
-        if self.has_content() || self.pages.is_empty() {
+        if self.has_content() || (ensure_page && self.pages.is_empty()) {
             self.finish_page();
         }
         // A note that ran past the last page of body text still has to land
@@ -1160,7 +1537,7 @@ fn draw_note(
 /// the top of a fresh page and carry no separator rule. There is no body text
 /// on these pages for a rule to divide them from.
 pub fn append_endnote_pages(
-    pages: &mut Vec<PageFrame>,
+    pages: &mut Vec<Arc<PageFrame>>,
     notes: &NoteRegistry,
     geometry: PageGeometry,
 ) {
@@ -1190,12 +1567,12 @@ pub fn append_endnote_pages(
     let mut page_number = pages.len() + 1;
 
     let mut flush = |elements: &mut Vec<PositionedElement>, page_number: &mut usize| {
-        pages.push(PageFrame::new(
+        pages.push(Arc::new(PageFrame::new(
             *page_number,
             geometry.page_width,
             geometry.page_height,
             std::mem::take(elements),
-        ));
+        )));
         *page_number += 1;
     };
 
@@ -1509,6 +1886,12 @@ fn paginate_paragraph(
     blocks: &[LayoutBlock],
     pager: &mut Pager,
 ) {
+    // Placement entry doubles as a page-boundary probe: when the paragraph
+    // could not fit and was moved here whole, or a page-break-before just
+    // finished the page, this is the first moment the fresh page is visible.
+    if pager.block_boundary(block_idx) {
+        return;
+    }
     let space_before = if pager.cursor_y == 0.0 {
         0.0
     } else {

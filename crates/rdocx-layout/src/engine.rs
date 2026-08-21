@@ -249,6 +249,15 @@ pub struct Engine {
     /// still advances through every numbered paragraph. An edit therefore
     /// relays out only the paragraphs it touched.
     block_cache: std::collections::HashMap<u64, ParagraphBlock>,
+    /// Laid-out tables, keyed like the paragraph cache. Tables whose cells
+    /// render numbering markers or note references are not cached, for the
+    /// same reason marker paragraphs are not: their rendering consumes
+    /// cross-block state.
+    table_cache: std::collections::HashMap<u64, crate::table::TableBlock>,
+    /// Pages from the previous relayout of a single-section document, so an
+    /// edit repaginates only the pages around the change. See
+    /// [`paginator::PaginationCache`].
+    pagination_cache: Option<paginator::PaginationCache>,
 }
 
 impl Default for Engine {
@@ -263,6 +272,8 @@ impl Engine {
             font_manager: FontManager::new(),
             fonts_fingerprint: 0,
             block_cache: std::collections::HashMap::new(),
+            table_cache: std::collections::HashMap::new(),
+            pagination_cache: None,
         }
     }
 
@@ -272,6 +283,8 @@ impl Engine {
             font_manager: FontManager::new_deterministic()?,
             fonts_fingerprint: 0,
             block_cache: std::collections::HashMap::new(),
+            table_cache: std::collections::HashMap::new(),
+            pagination_cache: None,
         })
     }
 
@@ -319,6 +332,10 @@ impl Engine {
         // Build sections: each section has blocks + geometry + header/footer
         let mut sections: Vec<paginator::Section> = Vec::new();
         let mut current_blocks: Vec<LayoutBlock> = Vec::new();
+        // Pagination identity per block, aligned with the block list of a
+        // single-section document (the only shape the pagination cache
+        // accepts; a section break mid-list leaves this misaligned and unused).
+        let mut block_fps: Vec<u64> = Vec::new();
         let mut current_sect_pr: Option<CT_SectPr> = None; // Will be set from paragraph sect_pr
 
         for content in &input.document.body.content {
@@ -377,7 +394,9 @@ impl Engine {
                             Some(projected_paragraph_text(para, input.revision_view));
                     }
 
-                    current_blocks.push(LayoutBlock::Paragraph(para_block));
+                    let block = LayoutBlock::Paragraph(para_block);
+                    block_fps.push(combine_fp(cache_key, pagination_salt(&block)));
+                    current_blocks.push(block);
 
                     // If this paragraph has sect_pr, it ends a section
                     if let Some(sect_pr) = para_sect_pr {
@@ -405,17 +424,40 @@ impl Engine {
                     let sect_pr_for_layout = current_sect_pr.as_ref().unwrap_or(&final_sect_pr);
                     let geometry = sect_pr_to_geometry(sect_pr_for_layout);
 
-                    let table_block = table::layout_table(
+                    let table_fp = fingerprint_table(
                         tbl,
                         geometry.content_width(),
-                        styles,
-                        input,
-                        &media,
-                        &mut self.font_manager,
-                        &mut num_state,
-                        &mut diagnostics,
-                    )?;
-                    current_blocks.push(LayoutBlock::Table(table_block));
+                        input.revision_view as u8,
+                        self.fonts_fingerprint,
+                    );
+                    let table_block = if let Some(hit) = self.table_cache.get(&table_fp) {
+                        hit.clone()
+                    } else {
+                        let block = table::layout_table(
+                            tbl,
+                            geometry.content_width(),
+                            styles,
+                            input,
+                            &media,
+                            &mut self.font_manager,
+                            &mut num_state,
+                            &mut diagnostics,
+                        )?;
+                        // A cache hit skips layout_table, so NumberingState
+                        // would not advance through numbered cell paragraphs,
+                        // and note-reference markers render from note order:
+                        // tables touching either stay uncached.
+                        if !table_renders_shared_state(&block) {
+                            if self.table_cache.len() >= 1_000 {
+                                self.table_cache.clear();
+                            }
+                            self.table_cache.insert(table_fp, block.clone());
+                        }
+                        block
+                    };
+                    let block = LayoutBlock::Table(table_block);
+                    block_fps.push(combine_fp(table_fp, pagination_salt(&block)));
+                    current_blocks.push(block);
                 }
                 _ => {} // Skip RawXml elements during layout
             }
@@ -464,9 +506,43 @@ impl Engine {
         let blocks_ms = t_blocks.elapsed().as_secs_f64() * 1000.0;
         #[cfg(not(target_arch = "wasm32"))]
         let t_pag = std::time::Instant::now();
-        // Paginate across all sections
-        let (mut pages, outlines) =
-            paginator::paginate_sections(&sections, &self.font_manager, &media, &notes);
+        // Everything pagination reads besides the block stream; a change in
+        // any of it invalidates the whole pagination cache. Styles and
+        // numbering definitions are deliberately absent, matching the block
+        // cache's documented "style definitions are not fingerprinted" limit.
+        let env_fp = {
+            let mut fp = Fingerprint::new();
+            fp.eat_debug(&final_sect_pr);
+            let mut ids: Vec<&String> = input.headers.keys().collect();
+            ids.sort();
+            for id in ids {
+                fp.eat(id.as_bytes());
+                fp.eat_debug(&input.headers[id]);
+            }
+            let mut ids: Vec<&String> = input.footers.keys().collect();
+            ids.sort();
+            for id in ids {
+                fp.eat(id.as_bytes());
+                fp.eat_debug(&input.footers[id]);
+            }
+            fp.eat_debug(&input.footnotes);
+            fp.eat_debug(&input.endnotes);
+            fp.eat(&[input.revision_view as u8]);
+            fp.eat(&self.fonts_fingerprint.to_le_bytes());
+            fp.finish()
+        };
+
+        // Paginate across all sections, reusing the previous relayout's
+        // pages around the first changed block where that is sound.
+        let (mut pages, outlines) = paginator::paginate_sections_cached(
+            &sections,
+            &self.font_manager,
+            &media,
+            &notes,
+            (sections.len() == 1).then_some(block_fps.as_slice()),
+            env_fp,
+            &mut self.pagination_cache,
+        );
         #[cfg(not(target_arch = "wasm32"))]
         if std::env::var("RDOCX_TIMING").is_ok() {
             eprintln!(
@@ -498,6 +574,16 @@ impl Engine {
             })
             .collect::<HashMap<_, _>>();
         for page in &mut pages {
+            // Pages are shared with the pagination cache; only unshare the
+            // ones substitution would actually rewrite, so pages without any
+            // field stay a pointer copy across relayouts.
+            let has_field = page.elements.iter().any(|element| {
+                matches!(element, PositionedElement::Text(run) if run.field_kind.is_some())
+            });
+            if !has_field {
+                continue;
+            }
+            let page = std::sync::Arc::make_mut(page);
             let page_num = page.page_number;
             substitute_fields(
                 &mut page.elements,
@@ -534,14 +620,14 @@ impl Engine {
             creator: Some("rdocx".to_string()),
         });
 
-        let mut result = LayoutResult::new(pages, fonts, metadata, outlines);
+        let mut result = LayoutResult::from_shared(pages, fonts, metadata, outlines);
         result.diagnostics = diagnostics;
         Ok(result)
     }
 }
 
 /// Apply page background color from `w:background` element to all pages.
-fn apply_page_background(pages: &mut [PageFrame], input: &LayoutInput) {
+fn apply_page_background(pages: &mut [std::sync::Arc<PageFrame>], input: &LayoutInput) {
     let bg_xml = match &input.document.background_xml {
         Some(xml) => xml,
         None => return,
@@ -557,6 +643,7 @@ fn apply_page_background(pages: &mut [PageFrame], input: &LayoutInput) {
 
     // Insert a full-page FilledRect at position 0 on every page (renders underneath everything)
     for page in pages.iter_mut() {
+        let page = std::sync::Arc::make_mut(page);
         page.elements.insert(
             0,
             PositionedElement::FilledRect {
@@ -3494,7 +3581,7 @@ mod tests {
         let all: String = output
             .pages
             .iter()
-            .map(page_text)
+            .map(|page| page_text(page))
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(
@@ -4641,6 +4728,167 @@ mod tests {
         assert!(text.iter().any(|value| value == "2"), "{text:?}");
         assert!(!text.iter().any(|value| value == "cached"), "{text:?}");
     }
+
+    // --- restartable pagination -------------------------------------------
+
+    fn many_paragraph_input(n: usize) -> LayoutInput {
+        let mut doc = rdocx_oxml::document::CT_Document::new();
+        for i in 0..n {
+            let mut p = CT_P::new();
+            if i % 30 == 5 {
+                p.properties.get_or_insert_with(Default::default).style_id =
+                    Some("Heading1".to_string());
+                p.add_run(&format!("Heading {i}"));
+            } else {
+                p.add_run(&format!(
+                    "Paragraph {i}: the quick brown fox jumps over the lazy dog, \
+                     again and again, until the page runs out of room and the \
+                     paginator has to start another one to hold the rest."
+                ));
+            }
+            doc.body.add_paragraph(p);
+        }
+        let mut input = make_input_with_text("");
+        input.document = doc;
+        input
+    }
+
+    fn set_paragraph_text(input: &mut LayoutInput, idx: usize, text: &str) {
+        let BodyContent::Paragraph(p) = &mut input.document.body.content[idx] else {
+            panic!("expected paragraph at {idx}");
+        };
+        *p = CT_P::new();
+        p.add_run(text);
+    }
+
+    fn pages_debug(result: &LayoutResult) -> Vec<String> {
+        result.pages.iter().map(|p| format!("{p:?}")).collect()
+    }
+
+    /// The invariant restartable pagination must never break: a relayout on
+    /// an engine holding cached pages produces byte-for-byte what a fresh
+    /// engine computes from scratch.
+    fn assert_cached_relayout_matches_fresh(edit: impl Fn(&mut LayoutInput)) {
+        let mut input = many_paragraph_input(120);
+        let mut engine = Engine::new_deterministic().expect("deterministic engine");
+        let first = engine.layout(&input).expect("first layout");
+        assert!(
+            first.pages.len() >= 4,
+            "test document must span several pages, got {}",
+            first.pages.len()
+        );
+        edit(&mut input);
+        let cached = engine.layout(&input).expect("cached relayout");
+        let fresh = Engine::new_deterministic()
+            .expect("deterministic engine")
+            .layout(&input)
+            .expect("fresh layout");
+        assert_eq!(cached.pages.len(), fresh.pages.len(), "page count");
+        let (a, b) = (pages_debug(&cached), pages_debug(&fresh));
+        for (i, (a, b)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(a, b, "page {} differs between cached and fresh", i + 1);
+        }
+        assert_eq!(
+            format!("{:?}", cached.outlines),
+            format!("{:?}", fresh.outlines),
+            "outlines"
+        );
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_on_a_tail_edit() {
+        assert_cached_relayout_matches_fresh(|input| {
+            set_paragraph_text(input, 110, "changed near the end");
+        });
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_on_a_middle_edit() {
+        assert_cached_relayout_matches_fresh(|input| {
+            set_paragraph_text(
+                input,
+                60,
+                "changed in the middle, with enough new text that this \
+                 paragraph re-breaks into a different number of lines than \
+                 it had before the edit came in and moved everything around",
+            );
+        });
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_on_a_first_page_edit() {
+        assert_cached_relayout_matches_fresh(|input| {
+            set_paragraph_text(input, 0, "changed on page one");
+        });
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_on_insert_and_delete() {
+        assert_cached_relayout_matches_fresh(|input| {
+            let mut p = CT_P::new();
+            p.add_run("a brand new paragraph pushed into the middle");
+            input
+                .document
+                .body
+                .content
+                .insert(60, BodyContent::Paragraph(p));
+        });
+        assert_cached_relayout_matches_fresh(|input| {
+            input.document.body.content.remove(60);
+        });
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_without_any_edit() {
+        assert_cached_relayout_matches_fresh(|_| {});
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_when_a_heading_moves_pages() {
+        // Outline entries are filtered by page index during reuse; growing a
+        // paragraph right before a heading exercises that filtering.
+        assert_cached_relayout_matches_fresh(|input| {
+            set_paragraph_text(
+                input,
+                64,
+                "grown just before the heading at index 65 so the heading \
+                 slides toward the next page: the quick brown fox jumps over \
+                 the lazy dog and keeps going for a good while longer, well \
+                 past where the old paragraph used to stop, adding lines",
+            );
+        });
+    }
+
+    #[test]
+    fn multi_section_documents_bypass_the_pagination_cache() {
+        let input = make_two_section_input(6 * 1440, false);
+        let mut engine = Engine::new_deterministic().expect("deterministic engine");
+        let first = engine.layout(&input).expect("first layout");
+        assert!(
+            engine.pagination_cache.is_none(),
+            "multi-section documents must not populate the pagination cache"
+        );
+        let second = engine.layout(&input).expect("second layout");
+        assert_eq!(pages_debug(&first), pages_debug(&second));
+    }
+
+    #[test]
+    fn editing_a_footnote_definition_invalidates_cached_pages() {
+        // The paragraph fingerprints do not change when only the footnote
+        // part changes, so this relies entirely on the environment
+        // fingerprint.
+        let mut input = make_input_with_footnote(&["original note text"]);
+        let mut engine = Engine::new_deterministic().expect("deterministic engine");
+        engine.layout(&input).expect("first layout");
+        let replacement = make_input_with_footnote(&["rewritten note text"]);
+        input.footnotes = replacement.footnotes.clone();
+        let cached = engine.layout(&input).expect("cached relayout");
+        let fresh = Engine::new_deterministic()
+            .expect("deterministic engine")
+            .layout(&input)
+            .expect("fresh layout");
+        assert_eq!(pages_debug(&cached), pages_debug(&fresh));
+    }
 }
 
 /// Fast content fingerprint of a paragraph for the block cache.
@@ -4659,62 +4907,207 @@ fn fingerprint_paragraph(
     revision_view: u8,
     fonts_fingerprint: u64,
 ) -> u64 {
-    use rdocx_oxml::text::RunContent;
-    use std::fmt::Write as _;
+    let mut fp = Fingerprint::new();
+    fp.eat_paragraph(para);
+    fp.eat(&content_width.to_bits().to_le_bytes());
+    fp.eat(&[revision_view]);
+    fp.eat(&fonts_fingerprint.to_le_bytes());
+    fp.finish()
+}
 
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let mut eat = |bytes: &[u8]| {
-        for b in bytes {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// FNV-1a folding with a scratch buffer for the `Debug`-formatted pieces, so
+/// every fingerprint walker shares one hashing discipline.
+struct Fingerprint {
+    h: u64,
+    buf: String,
+}
+
+impl Fingerprint {
+    fn new() -> Self {
+        Fingerprint {
+            h: 0xcbf2_9ce4_8422_2325,
+            buf: String::new(),
         }
-    };
-    let mut small = String::new();
-    let _ = write!(small, "{:?}", para.properties);
-    eat(small.as_bytes());
-    for run in &para.runs {
-        eat(b"r");
-        small.clear();
-        let _ = write!(small, "{:?}", run.properties);
-        eat(small.as_bytes());
-        for content in &run.content {
-            match content {
-                RunContent::Text(t) => {
-                    eat(b"t");
-                    eat(t.text.as_bytes());
-                    eat(&[u8::from(t.preserve_space)]);
+    }
+
+    fn eat(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.h ^= u64::from(*b);
+            self.h = self.h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn eat_debug<T: std::fmt::Debug>(&mut self, value: &T) {
+        use std::fmt::Write as _;
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
+        let _ = write!(buf, "{value:?}");
+        self.eat(buf.as_bytes());
+        self.buf = buf;
+    }
+
+    /// The paragraph walk shared by the block cache and the table
+    /// fingerprint: run text as raw bytes (the hot path), the small or
+    /// usually-empty property/projection structures via `Debug`.
+    fn eat_paragraph(&mut self, para: &rdocx_oxml::text::CT_P) {
+        use rdocx_oxml::text::RunContent;
+
+        self.eat_debug(&para.properties);
+        for run in &para.runs {
+            self.eat(b"\x01r");
+            self.eat_debug(&run.properties);
+            for content in &run.content {
+                match content {
+                    RunContent::Text(t) => {
+                        self.eat(b"\x02t");
+                        self.eat(t.text.as_bytes());
+                        self.eat(&[u8::from(t.preserve_space)]);
+                    }
+                    other => {
+                        self.eat(b"\x02o");
+                        self.eat_debug(other);
+                    }
                 }
-                other => {
-                    eat(b"o");
-                    small.clear();
-                    let _ = write!(small, "{other:?}");
-                    eat(small.as_bytes());
+            }
+        }
+        if !(para.hyperlinks.is_empty()
+            && para.comment_ranges.is_empty()
+            && para.bookmark_markers.is_empty()
+            && para.extra_xml.is_empty()
+            && para.content_controls.is_empty()
+            && para.revisions.is_empty())
+        {
+            self.eat_debug(&para.hyperlinks);
+            self.eat_debug(&para.comment_ranges);
+            self.eat_debug(&para.bookmark_markers);
+            self.eat_debug(&para.extra_xml);
+            self.eat_debug(&para.content_controls);
+            self.eat_debug(&para.revisions);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.h
+    }
+}
+
+/// Content fingerprint of a table for pagination identity, walking rows,
+/// cells and cell paragraphs the same way `fingerprint_paragraph` walks a
+/// body paragraph. Nested tables and content controls are rare enough to go
+/// through `Debug` wholesale.
+fn fingerprint_table(
+    tbl: &rdocx_oxml::table::CT_Tbl,
+    content_width: f64,
+    revision_view: u8,
+    fonts_fingerprint: u64,
+) -> u64 {
+    use rdocx_oxml::table::CellContent;
+
+    let mut fp = Fingerprint::new();
+    fp.eat_debug(&tbl.properties);
+    fp.eat_debug(&tbl.grid);
+    if !(tbl.extra_xml.is_empty() && tbl.content_controls.is_empty()) {
+        fp.eat_debug(&tbl.extra_xml);
+        fp.eat_debug(&tbl.content_controls);
+    }
+    for row in &tbl.rows {
+        fp.eat(b"\x01R");
+        fp.eat_debug(&row.properties);
+        if !(row.extra_xml.is_empty() && row.content_controls.is_empty()) {
+            fp.eat_debug(&row.extra_xml);
+            fp.eat_debug(&row.content_controls);
+        }
+        for cell in &row.cells {
+            fp.eat(b"\x02C");
+            fp.eat_debug(&cell.properties);
+            if !cell.extra_xml.is_empty() {
+                fp.eat_debug(&cell.extra_xml);
+            }
+            for content in &cell.content {
+                match content {
+                    CellContent::Paragraph(p) => {
+                        fp.eat(b"\x03p");
+                        fp.eat_paragraph(p);
+                    }
+                    other => {
+                        fp.eat(b"\x03x");
+                        fp.eat_debug(other);
+                    }
                 }
             }
         }
     }
-    if !(para.hyperlinks.is_empty()
-        && para.comment_ranges.is_empty()
-        && para.bookmark_markers.is_empty()
-        && para.extra_xml.is_empty()
-        && para.content_controls.is_empty()
-        && para.revisions.is_empty())
-    {
-        small.clear();
-        let _ = write!(
-            small,
-            "{:?}{:?}{:?}{:?}{:?}{:?}",
-            para.hyperlinks,
-            para.comment_ranges,
-            para.bookmark_markers,
-            para.extra_xml,
-            para.content_controls,
-            para.revisions
-        );
-        eat(small.as_bytes());
+    fp.eat(&content_width.to_bits().to_le_bytes());
+    fp.eat(&[revision_view]);
+    fp.eat(&fonts_fingerprint.to_le_bytes());
+    fp.finish()
+}
+
+/// Whether any cell paragraph renders a numbering marker or a note
+/// reference — the cross-block state that makes a table unsafe to cache.
+fn table_renders_shared_state(table: &crate::table::TableBlock) -> bool {
+    use oxml_layout::LineItem;
+    table.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| {
+            cell.paragraphs.iter().any(|para| {
+                para.lines.iter().any(|line| {
+                    line.items.iter().any(|item| match item {
+                        LineItem::Marker(_) => true,
+                        LineItem::Text(seg) => seg.note.is_some(),
+                        _ => false,
+                    })
+                })
+            })
+        })
+    })
+}
+
+/// One pagination-identity value from a block's source fingerprint and its
+/// rendered-marker salt.
+fn combine_fp(source: u64, salt: u64) -> u64 {
+    source.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt
+}
+
+/// What a block renders from cross-block state that its source fingerprint
+/// cannot see: list numbering markers (NumberingState) and note reference
+/// markers (note numbering). Folding the rendered text of both into the
+/// pagination fingerprint makes "same fingerprint" mean "paginates AND
+/// renders identically", so inserting a numbered paragraph or a footnote
+/// reference invalidates every block whose marker text shifts.
+fn pagination_salt(block: &LayoutBlock) -> u64 {
+    use oxml_layout::LineItem;
+
+    fn eat_lines(fp: &mut Fingerprint, lines: &[oxml_layout::LayoutLine]) {
+        for line in lines {
+            for item in &line.items {
+                match item {
+                    LineItem::Marker(seg) => {
+                        fp.eat(b"\x01m");
+                        fp.eat(seg.text.as_bytes());
+                    }
+                    LineItem::Text(seg) if seg.note.is_some() => {
+                        fp.eat(b"\x01n");
+                        fp.eat(seg.text.as_bytes());
+                        fp.eat_debug(&seg.note);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
-    eat(&content_width.to_bits().to_le_bytes());
-    eat(&[revision_view]);
-    eat(&fonts_fingerprint.to_le_bytes());
-    h
+
+    let mut fp = Fingerprint::new();
+    match block {
+        LayoutBlock::Paragraph(para) => eat_lines(&mut fp, &para.lines),
+        LayoutBlock::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for para in &cell.paragraphs {
+                        eat_lines(&mut fp, &para.lines);
+                    }
+                }
+            }
+        }
+    }
+    fp.finish()
 }
