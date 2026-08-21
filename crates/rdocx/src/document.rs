@@ -5258,6 +5258,27 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: body content index of the nth body-level paragraph
+    /// (indexed as in `paragraphs()`), for `insert_paragraph`/`remove_content`.
+    /// Returns None when the paragraph is out of range or a content control
+    /// appears first (its nested paragraphs have no direct body index).
+    pub fn paragraph_body_index(&self, para_index: usize) -> Option<usize> {
+        let mut seen = 0usize;
+        for (body_idx, content) in self.document.body.content.iter().enumerate() {
+            match content {
+                BodyContent::Paragraph(_) => {
+                    if seen == para_index {
+                        return Some(body_idx);
+                    }
+                    seen += 1;
+                }
+                BodyContent::ContentControl(_) => return None,
+                BodyContent::Table(_) | BodyContent::RawXml(_) => {}
+            }
+        }
+        None
+    }
+
     /// Render the document to PDF bytes with the selected revision view.
     pub fn to_pdf_with_options(&self, options: RenderOptions) -> Result<Vec<u8>> {
         let layout = self.layout_with_options(options)?;

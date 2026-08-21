@@ -390,6 +390,43 @@ impl<'a> Paragraph<'a> {
         self.inner.runs.get_mut(index).map(|inner| Run { inner })
     }
 
+    /// SVG PoC patch: split the text-only run at `index` at character offset
+    /// `at`, cloning its properties into both halves. Paragraph boundary
+    /// projections stay aligned via `CT_P::insert_unwrapped_run`. Returns
+    /// false for out-of-range indices or runs with non-text content; offsets
+    /// at the run edges are a successful no-op.
+    pub fn split_run(&mut self, index: usize, at: usize) -> bool {
+        use rdocx_oxml::text::{CT_Text, RunContent};
+        let Some(run) = self.inner.runs.get(index) else {
+            return false;
+        };
+        if run
+            .content
+            .iter()
+            .any(|c| !matches!(c, RunContent::Text(_)))
+        {
+            return false;
+        }
+        let text = run.text();
+        let total = text.chars().count();
+        if at == 0 || at >= total {
+            return true;
+        }
+        let byte = text
+            .char_indices()
+            .nth(at)
+            .map(|(b, _)| b)
+            .unwrap_or(text.len());
+        let mut tail = run.clone();
+        tail.replace_content(vec![RunContent::Text(CT_Text::new(&text[byte..]))]);
+        let head = text[..byte].to_string();
+        if !self.inner.insert_unwrapped_run(index + 1, tail) {
+            return false;
+        }
+        self.inner.runs[index].replace_content(vec![RunContent::Text(CT_Text::new(&head))]);
+        true
+    }
+
     /// Get an iterator over immutable run references.
     pub fn runs(&self) -> impl Iterator<Item = RunRef<'_>> {
         self.inner.runs.iter().map(|r| RunRef { inner: r })
