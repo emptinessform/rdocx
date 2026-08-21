@@ -588,13 +588,17 @@ impl Document {
             return Ok(Arc::clone(layout));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
         let input = self.build_layout_input();
+        #[cfg(not(target_arch = "wasm32"))]
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         #[cfg(test)]
         record_layout_invocation();
+        #[cfg(not(target_arch = "wasm32"))]
         let t1 = std::time::Instant::now();
         let layout = Arc::new(self.engine_layout(&input)?);
+        #[cfg(not(target_arch = "wasm32"))]
         if std::env::var("RDOCX_TIMING").is_ok() {
             eprintln!(
                 "timing: build_input {build_ms:.0} ms, engine.layout {:.0} ms",

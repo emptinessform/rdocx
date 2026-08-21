@@ -314,6 +314,7 @@ impl Engine {
             .cloned()
             .unwrap_or_else(CT_SectPr::default_letter);
 
+        #[cfg(not(target_arch = "wasm32"))]
         let t_blocks = std::time::Instant::now();
         // Build sections: each section has blocks + geometry + header/footer
         let mut sections: Vec<paginator::Section> = Vec::new();
@@ -467,11 +468,14 @@ impl Engine {
             &mut diagnostics,
         )?;
 
+        #[cfg(not(target_arch = "wasm32"))]
         let blocks_ms = t_blocks.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(not(target_arch = "wasm32"))]
         let t_pag = std::time::Instant::now();
         // Paginate across all sections
         let (mut pages, outlines) =
             paginator::paginate_sections(&sections, &self.font_manager, &media, &notes);
+        #[cfg(not(target_arch = "wasm32"))]
         if std::env::var("RDOCX_TIMING").is_ok() {
             eprintln!(
                 "timing: blocks {blocks_ms:.0} ms, paginate {:.0} ms",
