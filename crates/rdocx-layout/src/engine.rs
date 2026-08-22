@@ -3632,10 +3632,6 @@ pub(crate) fn layout_paragraph_with_source_in_table(
     // font metrics instead, so empty 7pt form cells stay ~8.4pt rows and
     // dense receipts match Word's pagination (tensorbee/rdocx#42).
     let _ = legacy_empty_line;
-    }
-    if inline_items.is_empty() {
-        convert::restore_word_line_heights(&mut lines, &effective_ppr);
-    }
 
     let mut result = block::build_paragraph_block(
         lines,
