@@ -3569,6 +3569,109 @@ impl Document {
         true
     }
 
+    /// SVG PoC patch: shared access to a top-level table for the structure
+    /// ops below. Tables carrying unmodeled raw XML or content controls are
+    /// refused conservatively — inserting/removing rows would shift the
+    /// indices their write-back positions are tagged with.
+    fn plain_table_mut(&mut self, table: usize) -> Option<&mut rdocx_oxml::table::CT_Tbl> {
+        let BodyContent::Table(t) = self.document.body.content.get_mut(table)? else {
+            return None;
+        };
+        if !t.extra_xml.is_empty() || !t.content_controls.is_empty() {
+            return None;
+        }
+        if t.rows
+            .iter()
+            .any(|r| !r.extra_xml.is_empty() || !r.content_controls.is_empty())
+        {
+            return None;
+        }
+        Some(t)
+    }
+
+    /// SVG PoC patch: insert a copy of row `row` right after it in the
+    /// top-level table at body index `table`. The clone keeps each cell's
+    /// properties (widths, borders, shading) but resets the content to one
+    /// empty paragraph — Word's "insert row below" formatting inheritance.
+    pub fn table_insert_row(&mut self, table: usize, row: usize) -> bool {
+        self.invalidate_layout();
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        let Some(src) = t.rows.get(row) else {
+            return false;
+        };
+        let mut new_row = src.clone();
+        for cell in &mut new_row.cells {
+            cell.content = vec![rdocx_oxml::table::CellContent::Paragraph(CT_P::new())];
+            cell.extra_xml.clear();
+        }
+        t.rows.insert(row + 1, new_row);
+        true
+    }
+
+    /// SVG PoC patch: remove one row; refuses to delete the last row.
+    pub fn table_delete_row(&mut self, table: usize, row: usize) -> bool {
+        self.invalidate_layout();
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        if t.rows.len() <= 1 || row >= t.rows.len() {
+            return false;
+        }
+        t.rows.remove(row);
+        true
+    }
+
+    /// SVG PoC patch: insert a column right of `col` — per row, a cleared
+    /// clone of that row's cell at `col`; the grid gains a copy of the
+    /// column width. Refuses ragged tables (a row without `col`).
+    pub fn table_insert_column(&mut self, table: usize, col: usize) -> bool {
+        self.invalidate_layout();
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        if t.rows.is_empty() || t.rows.iter().any(|r| r.cells.get(col).is_none()) {
+            return false;
+        }
+        for row in &mut t.rows {
+            let mut c = row.cells[col].clone();
+            c.content = vec![rdocx_oxml::table::CellContent::Paragraph(CT_P::new())];
+            c.extra_xml.clear();
+            row.cells.insert(col + 1, c);
+        }
+        if let Some(grid) = &mut t.grid
+            && let Some(gc) = grid.columns.get(col).cloned()
+        {
+            grid.columns.insert(col + 1, gc);
+        }
+        true
+    }
+
+    /// SVG PoC patch: remove one column from every row (and the grid);
+    /// refuses when any row would lose its last cell.
+    pub fn table_delete_column(&mut self, table: usize, col: usize) -> bool {
+        self.invalidate_layout();
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        if t.rows
+            .iter()
+            .any(|r| r.cells.len() <= 1 || r.cells.get(col).is_none())
+        {
+            return false;
+        }
+        for row in &mut t.rows {
+            row.cells.remove(col);
+        }
+        if let Some(grid) = &mut t.grid
+            && col < grid.columns.len()
+        {
+            grid.columns.remove(col);
+        }
+        true
+    }
+
     /// SVG PoC patch: every note reference inside one body content item
     /// (a paragraph, or a table including nested tables), as
     /// `(is_footnote, id)`. Selection deletion uses this before removing a
@@ -9774,6 +9877,44 @@ mod odttf_tests {
             Some("미주 본문 수정"),
             "endnotes part must round-trip through save"
         );
+    }
+
+    // SVG PoC patch: table structure ops clone formatting, keep the grid in
+    // step, and refuse the degenerate cases.
+    #[test]
+    fn table_row_and_column_ops() {
+        let mut doc = Document::new();
+        let mut t = doc.add_table(2, 2);
+        for r in 0..2 {
+            for c in 0..2 {
+                if let Some(mut cell) = t.cell(r, c) {
+                    cell.set_text(&format!("r{r}c{c}"));
+                }
+            }
+        }
+        let cell_text = |d: &Document, r: usize, c: usize| {
+            d.paragraph_text_at_path(&[0, r, c, 0])
+        };
+
+        assert!(doc.table_insert_row(0, 0));
+        assert_eq!(cell_text(&doc, 1, 0).as_deref(), Some(""), "new row empty");
+        assert_eq!(cell_text(&doc, 2, 0).as_deref(), Some("r1c0"), "old row shifted");
+
+        assert!(doc.table_delete_row(0, 1));
+        assert_eq!(cell_text(&doc, 1, 0).as_deref(), Some("r1c0"));
+
+        assert!(doc.table_insert_column(0, 0));
+        assert_eq!(cell_text(&doc, 0, 1).as_deref(), Some(""), "new column empty");
+        assert_eq!(cell_text(&doc, 0, 2).as_deref(), Some("r0c1"), "old column shifted");
+
+        assert!(doc.table_delete_column(0, 1));
+        assert_eq!(cell_text(&doc, 0, 1).as_deref(), Some("r0c1"));
+
+        // Degenerate refusals: last row / last column stay.
+        assert!(doc.table_delete_row(0, 0));
+        assert!(!doc.table_delete_row(0, 0), "last row refused");
+        assert!(doc.table_delete_column(0, 0));
+        assert!(!doc.table_delete_column(0, 0), "last column refused");
     }
 
     // SVG PoC patch: endnote insertion places a reference run at the char
