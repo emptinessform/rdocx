@@ -3560,6 +3560,80 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: edit one paragraph of a footnote addressed by its id
+    /// (the F-X037 Footnote story key). Footnotes are modeled as a typed
+    /// field, so this mutates in place and marks the part dirty.
+    pub fn with_footnote_paragraph_mut<R>(
+        &mut self,
+        note_id: i32,
+        para_index: usize,
+        f: impl FnOnce(Paragraph<'_>) -> R,
+    ) -> Option<R> {
+        self.invalidate_layout();
+        self.footnotes_dirty = true;
+        let note = self
+            .footnotes
+            .footnotes
+            .iter_mut()
+            .find(|n| n.id == note_id)?;
+        let inner = note.paragraphs.get_mut(para_index)?;
+        Some(f(Paragraph { inner }))
+    }
+
+    /// SVG PoC patch: read-only text of one footnote paragraph.
+    pub fn footnote_paragraph_text(&self, note_id: i32, para_index: usize) -> Option<String> {
+        let note = self.footnotes.footnotes.iter().find(|n| n.id == note_id)?;
+        Some(note.paragraphs.get(para_index)?.text())
+    }
+
+    /// SVG PoC patch: parse-edit-serialize one endnote paragraph addressed
+    /// by its id (endnotes are not a typed Document field yet, so this goes
+    /// through the package part like headers do).
+    pub fn with_endnote_paragraph_mut<R>(
+        &mut self,
+        note_id: i32,
+        para_index: usize,
+        f: impl FnOnce(Paragraph<'_>) -> R,
+    ) -> Option<R> {
+        use oxml_opc::relationship::rel_types;
+
+        let part_name = {
+            let rels = self.package.get_part_rels(&self.doc_part_name)?;
+            let rel = rels
+                .items
+                .iter()
+                .find(|r| r.rel_type == rel_types::ENDNOTES)?;
+            OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target)
+        };
+        let mut notes =
+            rdocx_oxml::footnotes::CT_Footnotes::from_xml(self.package.get_part(&part_name)?)
+                .ok()?;
+        let note = notes.footnotes.iter_mut().find(|n| n.id == note_id)?;
+        let inner = note.paragraphs.get_mut(para_index)?;
+        let out = f(Paragraph { inner });
+        let xml = notes.to_xml_endnotes().ok()?;
+        self.invalidate_layout();
+        self.package.set_part(&part_name, xml);
+        Some(out)
+    }
+
+    /// SVG PoC patch: read-only text of one endnote paragraph.
+    pub fn endnote_paragraph_text(&self, note_id: i32, para_index: usize) -> Option<String> {
+        use oxml_opc::relationship::rel_types;
+
+        let rels = self.package.get_part_rels(&self.doc_part_name)?;
+        let rel = rels
+            .items
+            .iter()
+            .find(|r| r.rel_type == rel_types::ENDNOTES)?;
+        let part_name = OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
+        let notes =
+            rdocx_oxml::footnotes::CT_Footnotes::from_xml(self.package.get_part(&part_name)?)
+                .ok()?;
+        let note = notes.footnotes.iter().find(|n| n.id == note_id)?;
+        Some(note.paragraphs.get(para_index)?.text())
+    }
+
     /// SVG PoC patch: parse-edit-serialize one paragraph of a header or
     /// footer part addressed by its document relationship id (the F-X037
     /// Header/Footer story key) and paragraph index. The part's own
