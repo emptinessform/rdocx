@@ -3403,11 +3403,7 @@ impl Document {
     /// path (body paragraphs and table cells alike). Returns the new note
     /// id. The offset counts the paragraph's concatenated run text, the
     /// editor's offset space; a mid-run boundary splits that run first.
-    pub fn insert_footnote_ref_at(
-        &mut self,
-        children: &[usize],
-        char_off: usize,
-    ) -> Option<i32> {
+    pub fn insert_footnote_ref_at(&mut self, children: &[usize], char_off: usize) -> Option<i32> {
         use rdocx_oxml::footnotes::{CT_Footnote, NoteType};
         use rdocx_oxml::text::RunContent;
 
