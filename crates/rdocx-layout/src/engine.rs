@@ -258,6 +258,18 @@ pub struct Engine {
     /// edit repaginates only the pages around the change. See
     /// [`paginator::PaginationCache`].
     pagination_cache: Option<paginator::PaginationCache>,
+    /// Laid-out header/footer content per section source, keyed like the
+    /// block caches. Entries whose blocks render numbering markers or note
+    /// references are never stored.
+    hf_cache: std::collections::HashMap<u64, Option<paginator::HeaderFooterContent>>,
+    /// Post-field-substitution pages from the previous relayout, positional:
+    /// `(pristine, substituted)` for page i. When page i is the same shared
+    /// pristine page as last time and the field environment is unchanged,
+    /// the substituted page is reused instead of unshared and reshaped.
+    subst_prev: Vec<(std::sync::Arc<PageFrame>, std::sync::Arc<PageFrame>)>,
+    /// Field environment of `subst_prev`: total page count and bookmark
+    /// target pages, everything substitution reads besides the page itself.
+    subst_env: u64,
 }
 
 impl Default for Engine {
@@ -274,6 +286,9 @@ impl Engine {
             block_cache: std::collections::HashMap::new(),
             table_cache: std::collections::HashMap::new(),
             pagination_cache: None,
+            hf_cache: std::collections::HashMap::new(),
+            subst_prev: Vec::new(),
+            subst_env: 0,
         }
     }
 
@@ -285,6 +300,9 @@ impl Engine {
             block_cache: std::collections::HashMap::new(),
             table_cache: std::collections::HashMap::new(),
             pagination_cache: None,
+            hf_cache: std::collections::HashMap::new(),
+            subst_prev: Vec::new(),
+            subst_env: 0,
         })
     }
 
@@ -401,12 +419,11 @@ impl Engine {
                     // If this paragraph has sect_pr, it ends a section
                     if let Some(sect_pr) = para_sect_pr {
                         let geometry = sect_pr_to_geometry(&sect_pr);
-                        let header_footer = layout_header_footer(
+                        let header_footer = self.layout_header_footer_cached(
                             &sect_pr,
                             input,
                             styles,
                             &media,
-                            &mut self.font_manager,
                             &mut num_state,
                             &mut diagnostics,
                         )?;
@@ -465,12 +482,11 @@ impl Engine {
 
         // Remaining blocks belong to the final section
         let final_geometry = sect_pr_to_geometry(&final_sect_pr);
-        let final_hf = layout_header_footer(
+        let final_hf = self.layout_header_footer_cached(
             &final_sect_pr,
             input,
             styles,
             &media,
-            &mut self.font_manager,
             &mut num_state,
             &mut diagnostics,
         )?;
@@ -517,16 +533,16 @@ impl Engine {
             ids.sort();
             for id in ids {
                 fp.eat(id.as_bytes());
-                fp.eat_debug(&input.headers[id]);
+                fp.eat_hdr_ftr(&input.headers[id]);
             }
             let mut ids: Vec<&String> = input.footers.keys().collect();
             ids.sort();
             for id in ids {
                 fp.eat(id.as_bytes());
-                fp.eat_debug(&input.footers[id]);
+                fp.eat_hdr_ftr(&input.footers[id]);
             }
-            fp.eat_debug(&input.footnotes);
-            fp.eat_debug(&input.endnotes);
+            fp.eat_notes(&input.footnotes);
+            fp.eat_notes(&input.endnotes);
             fp.eat(&[input.revision_view as u8]);
             fp.eat(&self.fonts_fingerprint.to_le_bytes());
             fp.finish()
@@ -573,7 +589,23 @@ impl Engine {
                 })
             })
             .collect::<HashMap<_, _>>();
-        for page in &mut pages {
+        // Everything substitution reads besides the page itself; while it is
+        // unchanged, a page that is still the same shared pristine page as
+        // last relayout substitutes to the same result.
+        let subst_env = {
+            let mut fp = Fingerprint::new();
+            fp.eat(&(total_pages as u64).to_le_bytes());
+            let mut targets: Vec<(usize, usize)> =
+                bookmark_pages.iter().map(|(t, p)| (*t, *p)).collect();
+            targets.sort_unstable();
+            for (t, p) in targets {
+                fp.eat(&(t as u64).to_le_bytes());
+                fp.eat(&(p as u64).to_le_bytes());
+            }
+            fp.finish()
+        };
+        let pristine: Vec<std::sync::Arc<PageFrame>> = pages.clone();
+        for (i, page) in pages.iter_mut().enumerate() {
             // Pages are shared with the pagination cache; only unshare the
             // ones substitution would actually rewrite, so pages without any
             // field stay a pointer copy across relayouts.
@@ -581,6 +613,13 @@ impl Engine {
                 matches!(element, PositionedElement::Text(run) if run.field_kind.is_some())
             });
             if !has_field {
+                continue;
+            }
+            if subst_env == self.subst_env
+                && let Some((old_pristine, old_subst)) = self.subst_prev.get(i)
+                && std::sync::Arc::ptr_eq(old_pristine, &pristine[i])
+            {
+                *page = std::sync::Arc::clone(old_subst);
                 continue;
             }
             let page = std::sync::Arc::make_mut(page);
@@ -593,6 +632,8 @@ impl Engine {
                 &mut self.font_manager,
             );
         }
+        self.subst_prev = pristine.into_iter().zip(pages.iter().cloned()).collect();
+        self.subst_env = subst_env;
 
         // Post-pagination pass: apply page background color
         apply_page_background(&mut pages, input);
@@ -623,6 +664,72 @@ impl Engine {
         let mut result = LayoutResult::from_shared(pages, fonts, metadata, outlines);
         result.diagnostics = diagnostics;
         Ok(result)
+    }
+
+    /// [`layout_header_footer`] behind a content-keyed cache, so a relayout
+    /// does not re-shape the same header/footer parts on every edit.
+    ///
+    /// Entries whose blocks render numbering markers or note references are
+    /// not cached: a hit skips `layout_header_footer`, which would stop
+    /// NumberingState from advancing and freeze note-marker numbering.
+    fn layout_header_footer_cached(
+        &mut self,
+        sect_pr: &CT_SectPr,
+        input: &LayoutInput,
+        styles: &CT_Styles,
+        media: &MediaRegistry,
+        num_state: &mut NumberingState,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<Option<paginator::HeaderFooterContent>> {
+        let key = {
+            let mut fp = Fingerprint::new();
+            fp.eat_debug(&sect_pr.header_refs);
+            fp.eat_debug(&sect_pr.footer_refs);
+            for href in &sect_pr.header_refs {
+                if let Some(part) = input.headers.get(&href.rel_id) {
+                    fp.eat_hdr_ftr(part);
+                }
+            }
+            for fref in &sect_pr.footer_refs {
+                if let Some(part) = input.footers.get(&fref.rel_id) {
+                    fp.eat_hdr_ftr(part);
+                }
+            }
+            let geometry = sect_pr_to_geometry(sect_pr);
+            fp.eat(&geometry.content_width().to_bits().to_le_bytes());
+            fp.eat(&[input.revision_view as u8]);
+            fp.eat(&self.fonts_fingerprint.to_le_bytes());
+            fp.finish()
+        };
+        if let Some(hit) = self.hf_cache.get(&key) {
+            return Ok(hit.clone());
+        }
+        let built = layout_header_footer(
+            sect_pr,
+            input,
+            styles,
+            media,
+            &mut self.font_manager,
+            num_state,
+            diagnostics,
+        )?;
+        let cacheable = built.as_ref().map_or(true, |hf| {
+            ![
+                &hf.header_blocks,
+                &hf.footer_blocks,
+                &hf.first_header_blocks,
+                &hf.first_footer_blocks,
+            ]
+            .iter()
+            .any(|blocks| para_blocks_render_shared_state(blocks))
+        });
+        if cacheable {
+            if self.hf_cache.len() >= 64 {
+                self.hf_cache.clear();
+            }
+            self.hf_cache.insert(key, built.clone());
+        }
+        Ok(built)
     }
 }
 
@@ -4765,11 +4872,55 @@ mod tests {
         result.pages.iter().map(|p| format!("{p:?}")).collect()
     }
 
+    /// Attach a text header and a "Page {PAGE}" footer to the input's body
+    /// section, the common shape that exercises the header/footer cache and
+    /// per-page field substitution reuse.
+    fn attach_page_footer(input: &mut LayoutInput) {
+        use rdocx_oxml::header_footer::{CT_HdrFtr, HdrFtrRef, HdrFtrType};
+        use rdocx_oxml::text::{CT_R, Field, RunContent};
+
+        let mut header = CT_HdrFtr::new();
+        let mut hp = CT_P::new();
+        hp.add_run("Equivalence header");
+        header.paragraphs.push(hp);
+        input.headers.insert("rIdH1".to_string(), header);
+
+        let mut footer = CT_HdrFtr::new();
+        let mut fp = CT_P::new();
+        fp.add_run("Page ");
+        let mut run = CT_R::new("");
+        run.content = vec![RunContent::Field(Field::new(" PAGE ", "1"))];
+        fp.runs.push(run);
+        footer.paragraphs.push(fp);
+        input.footers.insert("rIdF1".to_string(), footer);
+
+        let sect_pr = input
+            .document
+            .body
+            .sect_pr
+            .get_or_insert_with(rdocx_oxml::document::CT_SectPr::default_letter);
+        sect_pr.header_refs.push(HdrFtrRef {
+            hdr_ftr_type: HdrFtrType::Default,
+            rel_id: "rIdH1".to_string(),
+        });
+        sect_pr.footer_refs.push(HdrFtrRef {
+            hdr_ftr_type: HdrFtrType::Default,
+            rel_id: "rIdF1".to_string(),
+        });
+    }
+
     /// The invariant restartable pagination must never break: a relayout on
     /// an engine holding cached pages produces byte-for-byte what a fresh
     /// engine computes from scratch.
     fn assert_cached_relayout_matches_fresh(edit: impl Fn(&mut LayoutInput)) {
-        let mut input = many_paragraph_input(120);
+        assert_cached_relayout_matches_fresh_on(many_paragraph_input(120), edit);
+    }
+
+    fn assert_cached_relayout_matches_fresh_on(
+        input: LayoutInput,
+        edit: impl Fn(&mut LayoutInput),
+    ) {
+        let mut input = input;
         let mut engine = Engine::new_deterministic().expect("deterministic engine");
         let first = engine.layout(&input).expect("first layout");
         assert!(
@@ -4856,6 +5007,50 @@ mod tests {
                  the lazy dog and keeps going for a good while longer, well \
                  past where the old paragraph used to stop, adding lines",
             );
+        });
+    }
+
+    #[test]
+    fn cached_repagination_matches_fresh_with_a_page_number_footer() {
+        // Middle edit: page numbers unchanged, so reused pages take the
+        // substituted-page shortcut — output must still be byte-identical.
+        let mut input = many_paragraph_input(120);
+        attach_page_footer(&mut input);
+        assert_cached_relayout_matches_fresh_on(input, |input| {
+            set_paragraph_text(input, 60, "changed in the middle");
+        });
+        // Insert enough text to change the page count: the substitution
+        // environment changes and every field page must be redone.
+        let mut input = many_paragraph_input(120);
+        attach_page_footer(&mut input);
+        assert_cached_relayout_matches_fresh_on(input, |input| {
+            for i in 0..6 {
+                let mut p = CT_P::new();
+                p.add_run(
+                    "a long inserted paragraph that adds real height to the \
+                     document so the total page count moves, invalidating \
+                     every page-number field after the insertion point",
+                );
+                input
+                    .document
+                    .body
+                    .content
+                    .insert(60 + i, BodyContent::Paragraph(p));
+            }
+        });
+    }
+
+    #[test]
+    fn editing_the_header_part_invalidates_cached_pages() {
+        let mut input = many_paragraph_input(120);
+        attach_page_footer(&mut input);
+        assert_cached_relayout_matches_fresh_on(input, |input| {
+            let header = input.headers.get_mut("rIdH1").expect("header part");
+            header.paragraphs[0] = {
+                let mut p = CT_P::new();
+                p.add_run("Rewritten header text");
+                p
+            };
         });
     }
 
@@ -4963,6 +5158,16 @@ impl Fingerprint {
                         self.eat(t.text.as_bytes());
                         self.eat(&[u8::from(t.preserve_space)]);
                     }
+                    // A field's Debug form includes a per-parse source_id
+                    // (a global counter), so hashing it wholesale would give
+                    // the same XML a different fingerprint on every
+                    // build_input. Hash what layout actually reads instead.
+                    RunContent::Field(field) => {
+                        self.eat(b"\x02f");
+                        self.eat(field.instruction.raw.as_bytes());
+                        self.eat(field.cached_result.as_bytes());
+                        self.eat_debug(&field.dirty);
+                    }
                     other => {
                         self.eat(b"\x02o");
                         self.eat_debug(other);
@@ -4983,6 +5188,35 @@ impl Fingerprint {
             self.eat_debug(&para.extra_xml);
             self.eat_debug(&para.content_controls);
             self.eat_debug(&para.revisions);
+        }
+    }
+
+    /// A header/footer part, walked so fields inside it hash by content
+    /// (see the `RunContent::Field` arm of `eat_paragraph`).
+    fn eat_hdr_ftr(&mut self, part: &rdocx_oxml::header_footer::CT_HdrFtr) {
+        for para in &part.paragraphs {
+            self.eat(b"\x01P");
+            self.eat_paragraph(para);
+        }
+        if !(part.extra_namespaces.is_empty() && part.extra_xml.is_empty()) {
+            self.eat_debug(&part.extra_namespaces);
+            self.eat_debug(&part.extra_xml);
+        }
+    }
+
+    /// A footnotes/endnotes part, walked for the same reason.
+    fn eat_notes(&mut self, part: &Option<rdocx_oxml::footnotes::CT_Footnotes>) {
+        let Some(part) = part else {
+            self.eat(b"\x01-");
+            return;
+        };
+        for note in &part.footnotes {
+            self.eat(b"\x01N");
+            self.eat_debug(&note.id);
+            self.eat_debug(&note.note_type);
+            for para in &note.paragraphs {
+                self.eat_paragraph(para);
+            }
         }
     }
 
@@ -5043,22 +5277,30 @@ fn fingerprint_table(
     fp.finish()
 }
 
+/// Whether any of these paragraph blocks renders a numbering marker or a
+/// note reference — the cross-block state that makes a block unsafe to
+/// cache (a cache hit would skip the NumberingState / note-order advance
+/// that produced the marker text).
+fn para_blocks_render_shared_state(blocks: &[ParagraphBlock]) -> bool {
+    use oxml_layout::LineItem;
+    blocks.iter().any(|para| {
+        para.lines.iter().any(|line| {
+            line.items.iter().any(|item| match item {
+                LineItem::Marker(_) => true,
+                LineItem::Text(seg) => seg.note.is_some(),
+                _ => false,
+            })
+        })
+    })
+}
+
 /// Whether any cell paragraph renders a numbering marker or a note
 /// reference — the cross-block state that makes a table unsafe to cache.
 fn table_renders_shared_state(table: &crate::table::TableBlock) -> bool {
-    use oxml_layout::LineItem;
     table.rows.iter().any(|row| {
-        row.cells.iter().any(|cell| {
-            cell.paragraphs.iter().any(|para| {
-                para.lines.iter().any(|line| {
-                    line.items.iter().any(|item| match item {
-                        LineItem::Marker(_) => true,
-                        LineItem::Text(seg) => seg.note.is_some(),
-                        _ => false,
-                    })
-                })
-            })
-        })
+        row.cells
+            .iter()
+            .any(|cell| para_blocks_render_shared_state(&cell.paragraphs))
     })
 }
 

@@ -90,6 +90,7 @@ impl Default for PageGeometry {
 }
 
 /// Header/footer content already laid out as paragraph blocks.
+#[derive(Clone)]
 pub struct HeaderFooterContent {
     pub header_blocks: Vec<ParagraphBlock>,
     pub footer_blocks: Vec<ParagraphBlock>,
