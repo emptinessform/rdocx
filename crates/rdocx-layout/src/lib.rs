@@ -91,12 +91,24 @@ pub fn layout_document_with_reusable_engine(
 pub fn layout_document_with_caller_fonts_and_provenance(
     input: &LayoutInput,
 ) -> Result<WordLayoutResult> {
-    // SVG PoC patch: seed the caller-fonts engine with the bundled faces so
-    // a wasm caller that only injects, say, a Korean font can still resolve
-    // Calibri/Times through the metric-compatible bundled set. Caller fonts
-    // stay highest priority via `load_additional_fonts`; the process
-    // system-font snapshot remains untouched, which is the isolation the
-    // caller-fonts path is meant to keep.
+    let (layout, source_nodes) =
+        engine::Engine::new_with_caller_fonts().layout_with_provenance(input)?;
+    Ok(WordLayoutResult {
+        layout,
+        revision_view: input.revision_view,
+        source_nodes,
+    })
+}
+
+
+/// SVG PoC patch: lay out with caller fonts on top of the bundled
+/// metric-compatible set — for wasm editors that inject one or two fonts
+/// and still need Calibri/Times to resolve. A separate entry point so the
+/// strict caller-fonts isolation of
+/// [`layout_document_with_caller_fonts_and_provenance`] stays intact.
+pub fn layout_document_with_fallback_fonts_and_provenance(
+    input: &LayoutInput,
+) -> Result<WordLayoutResult> {
     let mut engine = engine::Engine::new_deterministic()?;
     let (layout, source_nodes) = engine.layout_with_provenance(input)?;
     Ok(WordLayoutResult {
