@@ -3508,6 +3508,66 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: parse-edit-serialize one paragraph of a header or
+    /// footer part addressed by its document relationship id (the F-X037
+    /// Header/Footer story key) and paragraph index. The part's own
+    /// relationships (images) are untouched, so embedded content survives.
+    pub fn with_header_footer_paragraph_mut<R>(
+        &mut self,
+        is_header: bool,
+        rel_id: &str,
+        para_index: usize,
+        f: impl FnOnce(Paragraph<'_>) -> R,
+    ) -> Option<R> {
+        use oxml_opc::relationship::rel_types;
+
+        let want = if is_header {
+            rel_types::HEADER
+        } else {
+            rel_types::FOOTER
+        };
+        let part_name = {
+            let rels = self.package.get_part_rels(&self.doc_part_name)?;
+            let rel = rels
+                .items
+                .iter()
+                .find(|r| r.id == rel_id && r.rel_type == want)?;
+            OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target)
+        };
+        let mut hf = CT_HdrFtr::from_xml(self.package.get_part(&part_name)?).ok()?;
+        let inner = hf.paragraphs.get_mut(para_index)?;
+        let out = f(Paragraph { inner });
+        let xml = Self::serialize_hdr_ftr(&hf, is_header).ok()?;
+        self.invalidate_layout();
+        self.package.set_part(&part_name, xml);
+        Some(out)
+    }
+
+    /// SVG PoC patch: read-only text of one header/footer paragraph, the
+    /// counterpart of [`Self::with_header_footer_paragraph_mut`].
+    pub fn header_footer_paragraph_text(
+        &self,
+        is_header: bool,
+        rel_id: &str,
+        para_index: usize,
+    ) -> Option<String> {
+        use oxml_opc::relationship::rel_types;
+
+        let want = if is_header {
+            rel_types::HEADER
+        } else {
+            rel_types::FOOTER
+        };
+        let rels = self.package.get_part_rels(&self.doc_part_name)?;
+        let rel = rels
+            .items
+            .iter()
+            .find(|r| r.id == rel_id && r.rel_type == want)?;
+        let part_name = OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
+        let hf = CT_HdrFtr::from_xml(self.package.get_part(&part_name)?).ok()?;
+        Some(hf.paragraphs.get(para_index)?.text())
+    }
+
     /// SVG PoC patch: the paragraph at an F-X037 Document-story source path.
     ///
     /// `children` is `WordSourcePath::children` for `WordStory::Document`:
