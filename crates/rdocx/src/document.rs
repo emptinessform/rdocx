@@ -4160,7 +4160,15 @@ impl Document {
             chart_color_map: oxml_drawing::color::ColorMap::default(),
             core_properties: self.core_properties.clone(),
             hyperlink_urls,
-            footnotes,
+            // SVG PoC patch: the typed field is authoritative — it is loaded
+            // from the part on open and mutated by editing APIs before any
+            // save re-serializes the part. Reading only the package part
+            // here made unsaved footnotes invisible to layout.
+            footnotes: if self.footnotes.footnotes.is_empty() {
+                footnotes
+            } else {
+                Some(self.footnotes.clone())
+            },
             endnotes,
             theme,
             fonts,
