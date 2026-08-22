@@ -3683,6 +3683,48 @@ impl Document {
         true
     }
 
+    /// SVG PoC patch: every note reference inside one body content item
+    /// (a paragraph, or a table including nested tables), as
+    /// `(is_footnote, id)`. Selection deletion uses this before removing a
+    /// covered table so its notes go with it.
+    pub fn note_refs_in_content(&self, body_index: usize) -> Vec<(bool, i32)> {
+        use rdocx_oxml::table::CellContent;
+        use rdocx_oxml::text::RunContent;
+
+        fn from_paragraph(p: &CT_P, out: &mut Vec<(bool, i32)>) {
+            for r in &p.runs {
+                for c in &r.content {
+                    match c {
+                        RunContent::FootnoteRef { id } => out.push((true, *id)),
+                        RunContent::EndnoteRef { id } => out.push((false, *id)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        fn from_table(t: &rdocx_oxml::table::CT_Tbl, out: &mut Vec<(bool, i32)>) {
+            for row in &t.rows {
+                for cell in &row.cells {
+                    for content in &cell.content {
+                        match content {
+                            CellContent::Paragraph(p) => from_paragraph(p, out),
+                            CellContent::Table(nested) => from_table(nested, out),
+                            CellContent::ContentControl(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        match self.document.body.content.get(body_index) {
+            Some(BodyContent::Paragraph(p)) => from_paragraph(p, &mut out),
+            Some(BodyContent::Table(t)) => from_table(t, &mut out),
+            _ => {}
+        }
+        out
+    }
+
     /// SVG PoC patch: insert an endnote reference run at (body path, char
     /// offset) and create a matching empty endnote. Mirror of
     /// [`Self::insert_footnote_ref_at`] over the typed endnotes field.
