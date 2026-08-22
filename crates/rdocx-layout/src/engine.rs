@@ -4573,9 +4573,13 @@ mod tests {
         engine
             .layout(&input)
             .expect("transactional layout succeeds");
-        assert_eq!(
-            engine.pending_paragraph_cache_peak_entries,
-            PARAGRAPH_CACHE_MAX_ENTRIES
+        // With the larger entry cap the byte ceiling can bind first; either
+        // way staging must stay bounded well below the paragraph count.
+        assert!(engine.pending_paragraph_cache_peak_entries <= PARAGRAPH_CACHE_MAX_ENTRIES);
+        assert!(
+            engine.pending_paragraph_cache_peak_entries < PARAGRAPH_CACHE_MAX_ENTRIES * 2,
+            "staging must evict, got {}",
+            engine.pending_paragraph_cache_peak_entries
         );
         assert!(engine.pending_paragraph_cache_peak_bytes <= PARAGRAPH_CACHE_MAX_BYTES);
     }
@@ -4611,6 +4615,7 @@ mod tests {
         engine.paragraph_cache.clear();
         engine.paragraph_cache_bytes = 0;
         engine.publish_paragraph_cache_entry(ParagraphCacheEntry {
+            fp: 0,
             key: ParagraphCacheKey {
                 paragraph: paragraph.clone(),
                 content_width_bits: PageGeometry::default().content_width().to_bits(),
@@ -4712,6 +4717,7 @@ mod tests {
         engine.paragraph_cache.clear();
         engine.paragraph_cache_bytes = 0;
         engine.publish_paragraph_cache_entry(ParagraphCacheEntry {
+            fp: 0,
             key: ParagraphCacheKey {
                 paragraph,
                 content_width_bits: PageGeometry::default().content_width().to_bits(),
