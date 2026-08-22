@@ -51,6 +51,8 @@ pub use paragraph::{
     TabAlignment, TabLeader,
 };
 pub use rdocx_layout::RevisionView;
+// SVG PoC patch: renderer-facing provenance types.
+pub use rdocx_layout::{WordLayoutResult, WordSourcePath, WordStory};
 pub use rdocx_oxml::settings::{
     CryptAlgorithmClass, CryptAlgorithmType, CryptProviderType, DocumentProtection, ProtectionMode,
 };
