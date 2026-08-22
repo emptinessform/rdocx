@@ -2965,10 +2965,41 @@ pub(crate) fn layout_paragraph_with_source(
     diagnostics: &mut Vec<Diagnostic>,
     source_node: Option<SourceNodeId>,
 ) -> Result<ParagraphBlock> {
+    layout_paragraph_with_source_in_table(
+        para,
+        available_width,
+        styles,
+        input,
+        media,
+        fm,
+        num_state,
+        diagnostics,
+        source_node,
+        None,
+    )
+}
+
+/// [`layout_paragraph_with_source`] with the table-style paragraph
+/// properties of the enclosing table, merged between docDefaults and the
+/// paragraph style per the OOXML cascade.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout_paragraph_with_source_in_table(
+    para: &CT_P,
+    available_width: f64,
+    styles: &CT_Styles,
+    input: &LayoutInput,
+    media: &MediaRegistry,
+    fm: &mut FontManager,
+    num_state: &mut NumberingState,
+    diagnostics: &mut Vec<Diagnostic>,
+    source_node: Option<SourceNodeId>,
+    table_ppr: Option<&rdocx_oxml::properties::CT_PPr>,
+) -> Result<ParagraphBlock> {
     // Resolve paragraph properties
     let para_style_id = para.properties.as_ref().and_then(|p| p.style_id.as_deref());
 
-    let resolved_ppr = style_resolver::resolve_paragraph_properties(para_style_id, styles);
+    let resolved_ppr =
+        style_resolver::resolve_paragraph_properties_in_table(para_style_id, styles, table_ppr);
 
     let mut effective_ppr = resolved_ppr;
 
@@ -3595,11 +3626,15 @@ pub(crate) fn layout_paragraph_with_source(
 
     let mut lines = break_into_lines(&inline_items, &line_params, fm)?;
     convert::restore_word_line_heights(&mut lines, &effective_ppr);
-    if let (Some(line), Some(legacy)) = (lines.first_mut(), legacy_empty_line) {
-        line.ascent = legacy.ascent;
-        line.descent = legacy.descent;
-        line.line_gap = legacy.line_gap;
-        line.height = legacy.height;
+    // F-X047 attributes empty paragraphs with a real zero-width segment
+    // (paragraph-mark rPr merged), but then restores the legacy 12pt
+    // no-metrics line height for compatibility. The SVG PoC keeps the real
+    // font metrics instead, so empty 7pt form cells stay ~8.4pt rows and
+    // dense receipts match Word's pagination (tensorbee/rdocx#42).
+    let _ = legacy_empty_line;
+    }
+    if inline_items.is_empty() {
+        convert::restore_word_line_heights(&mut lines, &effective_ppr);
     }
 
     let mut result = block::build_paragraph_block(
