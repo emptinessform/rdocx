@@ -5279,6 +5279,36 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: the paragraph at an F-X037 Document-story source path.
+    ///
+    /// `children` is `WordSourcePath::children` for `WordStory::Document`:
+    /// `[body_index]` for a body paragraph, then repeating
+    /// `row, cell, content` triples for (possibly nested) table cells.
+    pub fn paragraph_at_path_mut(&mut self, children: &[usize]) -> Option<Paragraph<'_>> {
+        self.invalidate_layout();
+        let (&body_index, rest) = children.split_first()?;
+        match self.document.body.content.get_mut(body_index)? {
+            BodyContent::Paragraph(inner) if rest.is_empty() => Some(Paragraph { inner }),
+            BodyContent::Table(table) if !rest.is_empty() => {
+                table_paragraph_at_path_mut(table, rest).map(|inner| Paragraph { inner })
+            }
+            _ => None,
+        }
+    }
+
+    /// SVG PoC patch: read-only text of the paragraph at a Document-story
+    /// source path, the counterpart of [`Self::paragraph_at_path_mut`].
+    pub fn paragraph_text_at_path(&self, children: &[usize]) -> Option<String> {
+        let (&body_index, rest) = children.split_first()?;
+        match self.document.body.content.get(body_index)? {
+            BodyContent::Paragraph(inner) if rest.is_empty() => Some(inner.text()),
+            BodyContent::Table(table) if !rest.is_empty() => {
+                table_paragraph_at_path(table, rest).map(|inner| inner.text())
+            }
+            _ => None,
+        }
+    }
+
     /// SVG PoC patch: body content index of the nth body-level paragraph
     /// (indexed as in `paragraphs()`), for `insert_paragraph`/`remove_content`.
     /// Returns None when the paragraph is out of range or a content control
@@ -12435,6 +12465,59 @@ mod odttf_tests {
                 Some(font.as_slice()),
                 "failed for {name}"
             );
+        }
+    }
+}
+
+/// SVG PoC patch: walk repeating `row, cell, content` path triples through
+/// (possibly nested) tables to one cell paragraph.
+fn table_paragraph_at_path_mut<'a>(
+    mut table: &'a mut rdocx_oxml::table::CT_Tbl,
+    mut rest: &[usize],
+) -> Option<&'a mut CT_P> {
+    loop {
+        let [row, cell, index, tail @ ..] = rest else {
+            return None;
+        };
+        let content = table
+            .rows
+            .get_mut(*row)?
+            .cells
+            .get_mut(*cell)?
+            .content
+            .get_mut(*index)?;
+        match content {
+            rdocx_oxml::table::CellContent::Paragraph(inner) if tail.is_empty() => {
+                return Some(inner);
+            }
+            rdocx_oxml::table::CellContent::Table(nested) if !tail.is_empty() => {
+                table = nested;
+                rest = tail;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// SVG PoC patch: read-only counterpart of [`table_paragraph_at_path_mut`].
+fn table_paragraph_at_path<'a>(
+    mut table: &'a rdocx_oxml::table::CT_Tbl,
+    mut rest: &[usize],
+) -> Option<&'a CT_P> {
+    loop {
+        let [row, cell, index, tail @ ..] = rest else {
+            return None;
+        };
+        let content = table.rows.get(*row)?.cells.get(*cell)?.content.get(*index)?;
+        match content {
+            rdocx_oxml::table::CellContent::Paragraph(inner) if tail.is_empty() => {
+                return Some(inner);
+            }
+            rdocx_oxml::table::CellContent::Table(nested) if !tail.is_empty() => {
+                table = nested;
+                rest = tail;
+            }
+            _ => return None,
         }
     }
 }
