@@ -97,6 +97,14 @@ pub struct Document {
     pub(crate) footnotes_part_name: Option<String>,
     /// Whether a facade mutation requires complete typed footnote serialization.
     pub(crate) footnotes_dirty: bool,
+    /// SVG PoC patch: typed endnotes loaded through the main document
+    /// relationship, promoted to a field exactly like footnotes so facade
+    /// edits mutate in place instead of round-tripping the package part.
+    pub(crate) endnotes: rdocx_oxml::footnotes::CT_Footnotes,
+    /// SVG PoC patch: existing endnotes relationship target. No conventional target is assumed on read.
+    pub(crate) endnotes_part_name: Option<String>,
+    /// SVG PoC patch: whether a facade mutation requires complete typed endnote serialization.
+    pub(crate) endnotes_dirty: bool,
     /// Typed comments loaded through the main document relationship.
     pub(crate) comments: Option<rdocx_oxml::comments::CT_Comments>,
     /// Existing comments relationship target. No target is invented on read.
@@ -439,6 +447,9 @@ impl Document {
             footnotes: rdocx_oxml::footnotes::CT_Footnotes::new(),
             footnotes_part_name: None,
             footnotes_dirty: false,
+            endnotes: rdocx_oxml::footnotes::CT_Footnotes::new(),
+            endnotes_part_name: None,
+            endnotes_dirty: false,
             comments: None,
             comments_part_name: None,
             comments_extended: None,
@@ -471,6 +482,9 @@ impl Document {
             footnotes: self.footnotes.clone(),
             footnotes_part_name: self.footnotes_part_name.clone(),
             footnotes_dirty: self.footnotes_dirty,
+            endnotes: self.endnotes.clone(),
+            endnotes_part_name: self.endnotes_part_name.clone(),
+            endnotes_dirty: self.endnotes_dirty,
             comments: self.comments.clone(),
             comments_part_name: self.comments_part_name.clone(),
             comments_extended: self.comments_extended.clone(),
@@ -585,6 +599,15 @@ impl Document {
             .and_then(|xml| rdocx_oxml::footnotes::CT_Footnotes::from_xml(xml).ok())
             .unwrap_or_default();
 
+        // SVG PoC patch: endnotes share the CT_Footnotes model and are
+        // promoted to a typed field the same way.
+        let endnotes_part_name = resolve_part(rel_types::ENDNOTES);
+        let endnotes = endnotes_part_name
+            .as_deref()
+            .and_then(|part| package.get_part(part))
+            .and_then(|xml| rdocx_oxml::footnotes::CT_Footnotes::from_xml(xml).ok())
+            .unwrap_or_default();
+
         let comments_part_name = resolve_part(rel_types::COMMENTS);
         let comments = match comments_part_name
             .as_deref()
@@ -621,6 +644,9 @@ impl Document {
             footnotes,
             footnotes_part_name,
             footnotes_dirty: false,
+            endnotes,
+            endnotes_part_name,
+            endnotes_dirty: false,
             comments,
             comments_part_name,
             comments_extended,
@@ -786,6 +812,26 @@ impl Document {
                 .get_or_create_part_rels(&self.doc_part_name.clone());
             if rels.get_by_type(rel_types::FOOTNOTES).is_none() {
                 rels.add(rel_types::FOOTNOTES, "footnotes.xml");
+            }
+        }
+
+        // SVG PoC patch: mirror the footnote flush for the typed endnotes.
+        if self.endnotes_dirty && !self.endnotes.footnotes.is_empty() {
+            let ex = self.endnotes.to_xml_endnotes()?;
+            let endnotes_part = self
+                .endnotes_part_name
+                .clone()
+                .unwrap_or_else(|| "/word/endnotes.xml".to_owned());
+            self.package.set_part(&endnotes_part, ex);
+            self.package.content_types.add_override(
+                &endnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+            );
+            let rels = self
+                .package
+                .get_or_create_part_rels(&self.doc_part_name.clone());
+            if rels.get_by_type(rel_types::ENDNOTES).is_none() {
+                rels.add(rel_types::ENDNOTES, "endnotes.xml");
             }
         }
 
@@ -1029,6 +1075,31 @@ impl Document {
         let mut p = CT_P::new();
         p.add_run(text);
         self.footnotes.footnotes.push(CT_Footnote {
+            id,
+            note_type: rdocx_oxml::footnotes::NoteType::Normal,
+            paragraphs: vec![p],
+        });
+        id
+    }
+
+    /// SVG PoC patch: add an endnote with the given text; returns its id.
+    /// Pair with `Paragraph::add_endnote_ref` to reference it from the body.
+    pub fn add_endnote(&mut self, text: &str) -> i32 {
+        self.invalidate_layout();
+        self.endnotes_dirty = true;
+        use rdocx_oxml::footnotes::CT_Footnote;
+        use rdocx_oxml::text::CT_P;
+        let id = self
+            .endnotes
+            .footnotes
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .unwrap_or(1)
+            + 1;
+        let mut p = CT_P::new();
+        p.add_run(text);
+        self.endnotes.footnotes.push(CT_Footnote {
             id,
             note_type: rdocx_oxml::footnotes::NoteType::Normal,
             paragraphs: vec![p],
@@ -3745,52 +3816,66 @@ impl Document {
         Some(note.paragraphs.get(para_index)?.text())
     }
 
-    /// SVG PoC patch: parse-edit-serialize one endnote paragraph addressed
-    /// by its id (endnotes are not a typed Document field yet, so this goes
-    /// through the package part like headers do).
+    /// SVG PoC patch: edit one paragraph of an endnote addressed by its id
+    /// (the F-X037 Endnote story key). Endnotes are a typed field like
+    /// footnotes, so this mutates in place and marks the part dirty.
     pub fn with_endnote_paragraph_mut<R>(
         &mut self,
         note_id: i32,
         para_index: usize,
         f: impl FnOnce(Paragraph<'_>) -> R,
     ) -> Option<R> {
-        use oxml_opc::relationship::rel_types;
-
-        let part_name = {
-            let rels = self.package.get_part_rels(&self.doc_part_name)?;
-            let rel = rels
-                .items
-                .iter()
-                .find(|r| r.rel_type == rel_types::ENDNOTES)?;
-            OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target)
-        };
-        let mut notes =
-            rdocx_oxml::footnotes::CT_Footnotes::from_xml(self.package.get_part(&part_name)?)
-                .ok()?;
-        let note = notes.footnotes.iter_mut().find(|n| n.id == note_id)?;
-        let inner = note.paragraphs.get_mut(para_index)?;
-        let out = f(Paragraph { inner });
-        let xml = notes.to_xml_endnotes().ok()?;
         self.invalidate_layout();
-        self.package.set_part(&part_name, xml);
-        Some(out)
+        self.endnotes_dirty = true;
+        let note = self.endnotes.footnotes.iter_mut().find(|n| n.id == note_id)?;
+        let inner = note.paragraphs.get_mut(para_index)?;
+        Some(f(Paragraph { inner }))
     }
 
     /// SVG PoC patch: read-only text of one endnote paragraph.
     pub fn endnote_paragraph_text(&self, note_id: i32, para_index: usize) -> Option<String> {
-        use oxml_opc::relationship::rel_types;
-
-        let rels = self.package.get_part_rels(&self.doc_part_name)?;
-        let rel = rels
-            .items
-            .iter()
-            .find(|r| r.rel_type == rel_types::ENDNOTES)?;
-        let part_name = OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target);
-        let notes =
-            rdocx_oxml::footnotes::CT_Footnotes::from_xml(self.package.get_part(&part_name)?)
-                .ok()?;
-        let note = notes.footnotes.iter().find(|n| n.id == note_id)?;
+        let note = self.endnotes.footnotes.iter().find(|n| n.id == note_id)?;
         Some(note.paragraphs.get(para_index)?.text())
+    }
+
+    /// SVG PoC patch: split one endnote paragraph (Enter inside a note).
+    pub fn split_endnote_paragraph(
+        &mut self,
+        note_id: i32,
+        para_index: usize,
+        char_off: usize,
+    ) -> bool {
+        self.invalidate_layout();
+        self.endnotes_dirty = true;
+        let Some(note) = self.endnotes.footnotes.iter_mut().find(|n| n.id == note_id) else {
+            return false;
+        };
+        let Some(p) = note.paragraphs.get_mut(para_index) else {
+            return false;
+        };
+        let Some(tail) = split_simple_paragraph(p, char_off) else {
+            return false;
+        };
+        note.paragraphs.insert(para_index + 1, tail);
+        true
+    }
+
+    /// SVG PoC patch: merge one endnote paragraph into its predecessor.
+    pub fn merge_endnote_paragraph(&mut self, note_id: i32, para_index: usize) -> bool {
+        self.invalidate_layout();
+        self.endnotes_dirty = true;
+        let Some(note) = self.endnotes.footnotes.iter_mut().find(|n| n.id == note_id) else {
+            return false;
+        };
+        if para_index == 0 || para_index >= note.paragraphs.len() {
+            return false;
+        }
+        let cur = note.paragraphs[para_index].clone();
+        if !merge_simple_paragraphs(&mut note.paragraphs[para_index - 1], &cur) {
+            return false;
+        }
+        note.paragraphs.remove(para_index);
+        true
     }
 
     /// SVG PoC patch: parse-edit-serialize one paragraph of a header or
@@ -4318,7 +4403,11 @@ impl Document {
             } else {
                 Some(self.footnotes.clone())
             },
-            endnotes,
+            endnotes: if self.endnotes.footnotes.is_empty() {
+                endnotes
+            } else {
+                Some(self.endnotes.clone())
+            },
             theme,
             fonts,
         }
@@ -9500,6 +9589,51 @@ mod odttf_tests {
                 "failed for {name}"
             );
         }
+    }
+
+    // SVG PoC patch: endnotes promoted to a typed field must behave exactly
+    // like footnotes — in-place edits, splits, merges, layout visibility
+    // before saving, and byte round-trips through the package.
+    #[test]
+    fn typed_endnotes_edit_split_merge_and_round_trip() {
+        let mut doc = Document::new();
+        let id = doc.add_endnote("미주 본문");
+        doc.add_paragraph("참조 문장").add_endnote_ref(id);
+
+        // Unsaved typed endnotes must reach layout (same rule as footnotes).
+        let input = doc.build_layout_input();
+        let notes = input.endnotes.expect("typed endnotes visible to layout");
+        assert_eq!(notes.get_by_id(id).map(|n| n.paragraphs.len()), Some(1));
+
+        doc.with_endnote_paragraph_mut(id, 0, |mut p| {
+            p.add_run(" 수정");
+        })
+        .expect("typed edit");
+        assert_eq!(
+            doc.endnote_paragraph_text(id, 0).as_deref(),
+            Some("미주 본문 수정")
+        );
+
+        assert!(doc.split_endnote_paragraph(id, 0, 2));
+        assert_eq!(doc.endnote_paragraph_text(id, 0).as_deref(), Some("미주"));
+        assert_eq!(
+            doc.endnote_paragraph_text(id, 1).as_deref(),
+            Some(" 본문 수정")
+        );
+        assert!(doc.merge_endnote_paragraph(id, 1));
+        assert_eq!(
+            doc.endnote_paragraph_text(id, 0).as_deref(),
+            Some("미주 본문 수정")
+        );
+        assert_eq!(doc.endnote_paragraph_text(id, 1), None);
+
+        let bytes = doc.to_bytes().expect("save");
+        let reopened = Document::from_bytes(&bytes).expect("reopen");
+        assert_eq!(
+            reopened.endnote_paragraph_text(id, 0).as_deref(),
+            Some("미주 본문 수정"),
+            "endnotes part must round-trip through save"
+        );
     }
 }
 
