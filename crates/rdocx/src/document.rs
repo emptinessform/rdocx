@@ -3622,6 +3622,72 @@ impl Document {
         p.inner.insert_unwrapped_run(insert_at, run)
     }
 
+    /// SVG PoC patch: remove the `index`-th inline image in document order
+    /// (body paragraphs and table cells, nested tables included) — the
+    /// inverse of [`Self::insert_image_at`] keyed the same way the SVG DOM
+    /// orders its `<image>` elements. The media part stays behind as a
+    /// harmless orphan; package garbage collection is out of scope.
+    pub fn remove_inline_image(&mut self, index: usize) -> bool {
+        use rdocx_oxml::table::CellContent;
+        use rdocx_oxml::text::RunContent;
+
+        fn strip_from_paragraph(p: &mut CT_P, seen: &mut usize, target: usize) -> bool {
+            for r in &mut p.runs {
+                let mut i = 0;
+                while i < r.content.len() {
+                    if matches!(r.content[i], RunContent::Drawing(_)) {
+                        if *seen == target {
+                            r.content.remove(i);
+                            return true;
+                        }
+                        *seen += 1;
+                    }
+                    i += 1;
+                }
+            }
+            false
+        }
+        fn strip_from_table(
+            t: &mut rdocx_oxml::table::CT_Tbl,
+            seen: &mut usize,
+            target: usize,
+        ) -> bool {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    for content in &mut cell.content {
+                        let hit = match content {
+                            CellContent::Paragraph(p) => strip_from_paragraph(p, seen, target),
+                            CellContent::Table(nested) => strip_from_table(nested, seen, target),
+                            CellContent::ContentControl(_) => false,
+                        };
+                        if hit {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        let mut seen = 0usize;
+        let mut removed = false;
+        for content in &mut self.document.body.content {
+            let hit = match content {
+                BodyContent::Paragraph(p) => strip_from_paragraph(p, &mut seen, index),
+                BodyContent::Table(t) => strip_from_table(t, &mut seen, index),
+                _ => false,
+            };
+            if hit {
+                removed = true;
+                break;
+            }
+        }
+        if removed {
+            self.invalidate_layout();
+        }
+        removed
+    }
+
     /// SVG PoC patch: shared access to a top-level table for the structure
     /// ops below. Tables carrying unmodeled raw XML or content controls are
     /// refused conservatively — inserting/removing rows would shift the
@@ -9930,6 +9996,50 @@ mod odttf_tests {
             Some("미주 본문 수정"),
             "endnotes part must round-trip through save"
         );
+    }
+
+    // SVG PoC patch: inline image insertion at an offset and removal by
+    // document order.
+    #[test]
+    fn inline_image_insert_and_remove() {
+        use rdocx_oxml::text::RunContent;
+
+        // 1x1 PNG.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let mut doc = Document::new();
+        doc.add_paragraph("가나다라");
+        doc.add_paragraph("마바사");
+        assert!(doc.insert_image_at(&[0], 2, png, "a.png", 300.0));
+        assert!(doc.insert_image_at(&[1], 1, png, "b.png", 300.0));
+
+        let count_images = |doc: &Document| {
+            doc.document
+                .body
+                .paragraphs()
+                .flat_map(|p| p.runs.iter())
+                .flat_map(|r| r.content.iter())
+                .filter(|c| matches!(c, RunContent::Drawing(_)))
+                .count()
+        };
+        assert_eq!(count_images(&doc), 2);
+
+        // Remove the second (document order) and verify the first survives.
+        assert!(doc.remove_inline_image(1));
+        assert_eq!(count_images(&doc), 1);
+        assert_eq!(
+            doc.paragraph_text_at_path(&[1]).as_deref(),
+            Some("마바사"),
+            "text untouched"
+        );
+        assert!(doc.remove_inline_image(0));
+        assert_eq!(count_images(&doc), 0);
+        assert!(!doc.remove_inline_image(0), "nothing left to remove");
     }
 
     // SVG PoC patch: table structure ops clone formatting, keep the grid in
