@@ -3560,6 +3560,110 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: create an empty footnote and insert its reference run
+    /// at a character offset of the paragraph at a Document-story source
+    /// path (body paragraphs and table cells alike). Returns the new note
+    /// id. The offset counts the paragraph's concatenated run text, the
+    /// editor's offset space; a mid-run boundary splits that run first.
+    pub fn insert_footnote_ref_at(
+        &mut self,
+        children: &[usize],
+        char_off: usize,
+    ) -> Option<i32> {
+        use rdocx_oxml::footnotes::{CT_Footnote, NoteType};
+        use rdocx_oxml::text::RunContent;
+
+        self.invalidate_layout();
+        self.footnotes_dirty = true;
+        let id = self
+            .footnotes
+            .footnotes
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .unwrap_or(1)
+            + 1;
+
+        {
+            let mut p = self.paragraph_at_path_mut(children)?;
+            // Find the run boundary at char_off, splitting mid-run if needed.
+            let mut acc = 0usize;
+            let mut insert_at = p.run_count();
+            for j in 0..p.run_count() {
+                let n = p.run(j).map(|r| r.text().chars().count()).unwrap_or(0);
+                if char_off <= acc {
+                    insert_at = j;
+                    break;
+                }
+                if char_off < acc + n {
+                    if !p.split_run(j, char_off - acc) {
+                        return None;
+                    }
+                    insert_at = j + 1;
+                    break;
+                }
+                acc += n;
+            }
+            let mut r = CT_R::new("");
+            r.content = vec![RunContent::FootnoteRef { id }];
+            if !p.inner.insert_unwrapped_run(insert_at, r) {
+                return None;
+            }
+        }
+
+        self.footnotes.footnotes.push(CT_Footnote {
+            id,
+            note_type: NoteType::Normal,
+            paragraphs: vec![CT_P::new()],
+        });
+        Some(id)
+    }
+
+    /// SVG PoC patch: remove a footnote and every reference run pointing at
+    /// it (body paragraphs and table cells). The inverse of
+    /// [`Self::insert_footnote_ref_at`].
+    pub fn remove_footnote(&mut self, note_id: i32) -> bool {
+        use rdocx_oxml::table::CellContent;
+        use rdocx_oxml::text::RunContent;
+
+        fn strip_refs(p: &mut CT_P, note_id: i32) {
+            p.runs.retain(|r| {
+                !r.content
+                    .iter()
+                    .any(|c| matches!(c, RunContent::FootnoteRef { id } if *id == note_id))
+            });
+        }
+        fn strip_table(table: &mut rdocx_oxml::table::CT_Tbl, note_id: i32) {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    for content in &mut cell.content {
+                        match content {
+                            CellContent::Paragraph(p) => strip_refs(p, note_id),
+                            CellContent::Table(nested) => strip_table(nested, note_id),
+                            CellContent::ContentControl(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let before = self.footnotes.footnotes.len();
+        self.footnotes.footnotes.retain(|n| n.id != note_id);
+        if self.footnotes.footnotes.len() == before {
+            return false;
+        }
+        self.invalidate_layout();
+        self.footnotes_dirty = true;
+        for content in &mut self.document.body.content {
+            match content {
+                BodyContent::Paragraph(p) => strip_refs(p, note_id),
+                BodyContent::Table(table) => strip_table(table, note_id),
+                _ => {}
+            }
+        }
+        true
+    }
+
     /// SVG PoC patch: split the paragraph at a Document-story source path
     /// at a character offset (Enter). The tail becomes a sibling paragraph
     /// right after; the original paragraph mark (including any sectPr) moves
