@@ -3569,6 +3569,59 @@ impl Document {
         true
     }
 
+    /// SVG PoC patch: insert an inline image run at (Document-story path,
+    /// char offset), splitting the run there like a note reference. The
+    /// image keeps its native size, scaled down to fit `max_width_pt`.
+    pub fn insert_image_at(
+        &mut self,
+        children: &[usize],
+        char_off: usize,
+        image_data: &[u8],
+        image_filename: &str,
+        max_width_pt: f64,
+    ) -> bool {
+        use rdocx_oxml::text::RunContent;
+
+        let Some(native) = oxml_media::probe(image_data).and_then(|i| i.native_size(72.0))
+        else {
+            return false;
+        };
+        let (mut w, mut h) = (native.width_emu as f64, native.height_emu as f64);
+        let max_emu = max_width_pt * 12700.0;
+        if w > max_emu {
+            h *= max_emu / w;
+            w = max_emu;
+        }
+        self.invalidate_layout();
+        let rel_id = self.embed_image(image_data, image_filename);
+        let inline = CT_Inline::new(&rel_id, w as i64, h as i64);
+        let drawing = CT_Drawing::inline(inline);
+        let mut run = CT_R::new("");
+        run.content = vec![RunContent::Drawing(drawing)];
+
+        let Some(mut p) = self.paragraph_at_path_mut(children) else {
+            return false;
+        };
+        let mut acc = 0usize;
+        let mut insert_at = p.run_count();
+        for j in 0..p.run_count() {
+            let n = p.run(j).map(|r| r.text().chars().count()).unwrap_or(0);
+            if char_off <= acc {
+                insert_at = j;
+                break;
+            }
+            if char_off < acc + n {
+                if !p.split_run(j, char_off - acc) {
+                    return false;
+                }
+                insert_at = j + 1;
+                break;
+            }
+            acc += n;
+        }
+        p.inner.insert_unwrapped_run(insert_at, run)
+    }
+
     /// SVG PoC patch: shared access to a top-level table for the structure
     /// ops below. Tables carrying unmodeled raw XML or content controls are
     /// refused conservatively — inserting/removing rows would shift the
