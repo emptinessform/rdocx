@@ -302,6 +302,27 @@ impl<'a> Paragraph<'a> {
         self.inner.runs.push(r);
     }
 
+    /// SVG PoC patch: enumerate note reference runs as
+    /// `(is_footnote, id, char_pos)`, where `char_pos` counts the text
+    /// characters before the reference. Selection deletion uses this to
+    /// decide which notes a range covers.
+    pub fn note_refs(&self) -> Vec<(bool, i32, usize)> {
+        use rdocx_oxml::text::RunContent;
+        let mut acc = 0usize;
+        let mut out = Vec::new();
+        for r in &self.inner.runs {
+            for c in &r.content {
+                match c {
+                    RunContent::FootnoteRef { id } => out.push((true, *id, acc)),
+                    RunContent::EndnoteRef { id } => out.push((false, *id, acc)),
+                    _ => {}
+                }
+            }
+            acc += r.text().chars().count();
+        }
+        out
+    }
+
     /// Add a run with the given text and return a mutable reference for chaining.
     pub fn add_run(&mut self, text: &str) -> Run<'_> {
         self.inner.runs.push(CT_R::new(text));
