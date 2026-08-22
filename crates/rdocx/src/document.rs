@@ -5279,6 +5279,227 @@ impl Document {
         self.to_pdf_with_options(RenderOptions::default())
     }
 
+    /// SVG PoC patch: split the paragraph at a Document-story source path
+    /// at a character offset (Enter). The tail becomes a sibling paragraph
+    /// right after; the original paragraph mark (including any sectPr) moves
+    /// to the tail, matching Word's Enter semantics. Returns false for
+    /// paragraphs carrying boundary projections (hyperlinks, comments,
+    /// bookmarks, controls, revisions) whose run anchors would need
+    /// remapping.
+    pub fn split_paragraph_at_path(&mut self, children: &[usize], char_off: usize) -> bool {
+        self.invalidate_layout();
+        let Some((&body_index, rest)) = children.split_first() else {
+            return false;
+        };
+        if rest.is_empty() {
+            let Some(BodyContent::Paragraph(p)) = self.document.body.content.get_mut(body_index)
+            else {
+                return false;
+            };
+            let Some(tail) = split_simple_paragraph(p, char_off) else {
+                return false;
+            };
+            self.document
+                .body
+                .content
+                .insert(body_index + 1, BodyContent::Paragraph(tail));
+            return true;
+        }
+        let Some(BodyContent::Table(table)) = self.document.body.content.get_mut(body_index) else {
+            return false;
+        };
+        let Some((cell, index)) = table_cell_slot_mut(table, rest) else {
+            return false;
+        };
+        let Some(rdocx_oxml::table::CellContent::Paragraph(p)) = cell.content.get_mut(index) else {
+            return false;
+        };
+        let Some(tail) = split_simple_paragraph(p, char_off) else {
+            return false;
+        };
+        cell.content
+            .insert(index + 1, rdocx_oxml::table::CellContent::Paragraph(tail));
+        true
+    }
+
+    /// SVG PoC patch: merge the paragraph at a Document-story source path
+    /// into its previous sibling in the same container (Backspace at offset
+    /// 0). Refuses when the previous sibling is not a plain paragraph.
+    pub fn merge_paragraph_at_path(&mut self, children: &[usize]) -> bool {
+        self.invalidate_layout();
+        let Some((&body_index, rest)) = children.split_first() else {
+            return false;
+        };
+        if rest.is_empty() {
+            if body_index == 0 {
+                return false;
+            }
+            let Some(BodyContent::Paragraph(_)) = self.document.body.content.get(body_index) else {
+                return false;
+            };
+            let Some(BodyContent::Paragraph(_)) = self.document.body.content.get(body_index - 1)
+            else {
+                return false;
+            };
+            let Some(BodyContent::Paragraph(cur)) =
+                self.document.body.content.get(body_index).cloned().into()
+            else {
+                return false;
+            };
+            let Some(BodyContent::Paragraph(prev)) =
+                self.document.body.content.get_mut(body_index - 1)
+            else {
+                return false;
+            };
+            if !merge_simple_paragraphs(prev, &cur) {
+                return false;
+            }
+            self.document.body.content.remove(body_index);
+            return true;
+        }
+        let Some(BodyContent::Table(table)) = self.document.body.content.get_mut(body_index) else {
+            return false;
+        };
+        let Some((cell, index)) = table_cell_slot_mut(table, rest) else {
+            return false;
+        };
+        if index == 0 {
+            return false;
+        }
+        let cur = match cell.content.get(index) {
+            Some(rdocx_oxml::table::CellContent::Paragraph(p)) => p.clone(),
+            _ => return false,
+        };
+        let Some(rdocx_oxml::table::CellContent::Paragraph(prev)) = cell.content.get_mut(index - 1)
+        else {
+            return false;
+        };
+        if !merge_simple_paragraphs(prev, &cur) {
+            return false;
+        }
+        cell.content.remove(index);
+        true
+    }
+
+    /// SVG PoC patch: split one header/footer paragraph (Enter in a header).
+    pub fn split_header_footer_paragraph(
+        &mut self,
+        is_header: bool,
+        rel_id: &str,
+        para_index: usize,
+        char_off: usize,
+    ) -> bool {
+        self.with_header_footer_part_mut(is_header, rel_id, |hf| {
+            let p = hf.paragraphs.get_mut(para_index)?;
+            let tail = split_simple_paragraph(p, char_off)?;
+            hf.paragraphs.insert(para_index + 1, tail);
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// SVG PoC patch: merge one header/footer paragraph into its predecessor.
+    pub fn merge_header_footer_paragraph(
+        &mut self,
+        is_header: bool,
+        rel_id: &str,
+        para_index: usize,
+    ) -> bool {
+        self.with_header_footer_part_mut(is_header, rel_id, |hf| {
+            if para_index == 0 || para_index >= hf.paragraphs.len() {
+                return None;
+            }
+            let cur = hf.paragraphs[para_index].clone();
+            if !merge_simple_paragraphs(&mut hf.paragraphs[para_index - 1], &cur) {
+                return None;
+            }
+            hf.paragraphs.remove(para_index);
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// SVG PoC patch: shared parse-edit-serialize over a whole header/footer
+    /// part, used by the paragraph-count-changing operations.
+    fn with_header_footer_part_mut<R>(
+        &mut self,
+        is_header: bool,
+        rel_id: &str,
+        f: impl FnOnce(&mut CT_HdrFtr) -> Option<R>,
+    ) -> Option<R> {
+        use oxml_opc::relationship::rel_types;
+
+        let want = if is_header {
+            rel_types::HEADER
+        } else {
+            rel_types::FOOTER
+        };
+        let part_name = {
+            let rels = self.package.get_part_rels(&self.doc_part_name)?;
+            let rel = rels
+                .items
+                .iter()
+                .find(|r| r.id == rel_id && r.rel_type == want)?;
+            OpcPackage::resolve_rel_target(&self.doc_part_name, &rel.target)
+        };
+        let mut hf = CT_HdrFtr::from_xml(self.package.get_part(&part_name)?).ok()?;
+        let out = f(&mut hf)?;
+        let xml = Self::serialize_hdr_ftr(&hf, is_header).ok()?;
+        self.invalidate_layout();
+        self.package.set_part(&part_name, xml);
+        Some(out)
+    }
+
+    /// SVG PoC patch: split one footnote paragraph (Enter inside a note).
+    pub fn split_footnote_paragraph(
+        &mut self,
+        note_id: i32,
+        para_index: usize,
+        char_off: usize,
+    ) -> bool {
+        self.invalidate_layout();
+        self.footnotes_dirty = true;
+        let Some(note) = self
+            .footnotes
+            .footnotes
+            .iter_mut()
+            .find(|n| n.id == note_id)
+        else {
+            return false;
+        };
+        let Some(p) = note.paragraphs.get_mut(para_index) else {
+            return false;
+        };
+        let Some(tail) = split_simple_paragraph(p, char_off) else {
+            return false;
+        };
+        note.paragraphs.insert(para_index + 1, tail);
+        true
+    }
+
+    /// SVG PoC patch: merge one footnote paragraph into its predecessor.
+    pub fn merge_footnote_paragraph(&mut self, note_id: i32, para_index: usize) -> bool {
+        self.invalidate_layout();
+        self.footnotes_dirty = true;
+        let Some(note) = self
+            .footnotes
+            .footnotes
+            .iter_mut()
+            .find(|n| n.id == note_id)
+        else {
+            return false;
+        };
+        if para_index == 0 || para_index >= note.paragraphs.len() {
+            return false;
+        }
+        let cur = note.paragraphs[para_index].clone();
+        if !merge_simple_paragraphs(&mut note.paragraphs[para_index - 1], &cur) {
+            return false;
+        }
+        note.paragraphs.remove(para_index);
+        true
+    }
+
     /// SVG PoC patch: edit one paragraph of a footnote addressed by its id
     /// (the F-X037 Footnote story key). Footnotes are modeled as a typed
     /// field, so this mutates in place and marks the part dirty.
@@ -12650,7 +12871,13 @@ fn table_paragraph_at_path<'a>(
         let [row, cell, index, tail @ ..] = rest else {
             return None;
         };
-        let content = table.rows.get(*row)?.cells.get(*cell)?.content.get(*index)?;
+        let content = table
+            .rows
+            .get(*row)?
+            .cells
+            .get(*cell)?
+            .content
+            .get(*index)?;
         match content {
             rdocx_oxml::table::CellContent::Paragraph(inner) if tail.is_empty() => {
                 return Some(inner);
@@ -12662,4 +12889,120 @@ fn table_paragraph_at_path<'a>(
             _ => return None,
         }
     }
+}
+
+/// SVG PoC patch: walk repeating `row, cell, content` path triples to the
+/// cell that OWNS the addressed content slot, returning the cell and the
+/// final content index (so callers can insert or remove siblings).
+fn table_cell_slot_mut<'a>(
+    mut table: &'a mut rdocx_oxml::table::CT_Tbl,
+    mut rest: &[usize],
+) -> Option<(&'a mut rdocx_oxml::table::CT_Tc, usize)> {
+    loop {
+        let [row, cell, index, tail @ ..] = rest else {
+            return None;
+        };
+        if tail.is_empty() {
+            let cell = table.rows.get_mut(*row)?.cells.get_mut(*cell)?;
+            if *index >= cell.content.len() {
+                return None;
+            }
+            return Some((cell, *index));
+        }
+        let content = table
+            .rows
+            .get_mut(*row)?
+            .cells
+            .get_mut(*cell)?
+            .content
+            .get_mut(*index)?;
+        match content {
+            rdocx_oxml::table::CellContent::Table(nested) => {
+                table = nested;
+                rest = tail;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// SVG PoC patch: split a plain paragraph at a character offset of its
+/// concatenated run text. Returns the tail paragraph, which receives the
+/// original paragraph mark (sectPr included) while the head keeps a copy
+/// without it — Word's Enter moves the existing mark down. None when the
+/// paragraph carries boundary projections whose run anchors would need
+/// remapping, or when the boundary falls inside a non-text run.
+fn split_simple_paragraph(p: &mut CT_P, char_off: usize) -> Option<CT_P> {
+    use rdocx_oxml::text::{CT_Text, RunContent};
+
+    if !(p.hyperlinks.is_empty()
+        && p.comment_ranges.is_empty()
+        && p.bookmark_markers.is_empty()
+        && p.extra_xml.is_empty()
+        && p.content_controls.is_empty()
+        && p.revisions.is_empty())
+    {
+        return None;
+    }
+    let mut acc = 0usize;
+    let mut tail_runs: Vec<CT_R> = Vec::new();
+    let mut split_done = false;
+    for j in 0..p.runs.len() {
+        let text = p.runs[j].text();
+        let n = text.chars().count();
+        if char_off <= acc {
+            tail_runs = p.runs.split_off(j);
+            split_done = true;
+            break;
+        }
+        if char_off < acc + n {
+            let inner = char_off - acc;
+            if p.runs[j]
+                .content
+                .iter()
+                .any(|c| !matches!(c, RunContent::Text(_)))
+            {
+                return None;
+            }
+            let byte = text
+                .char_indices()
+                .nth(inner)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            let mut tail_run = p.runs[j].clone();
+            tail_run.replace_content(vec![RunContent::Text(CT_Text::new(&text[byte..]))]);
+            tail_runs = vec![tail_run];
+            tail_runs.extend(p.runs.split_off(j + 1));
+            p.runs[j].replace_content(vec![RunContent::Text(CT_Text::new(&text[..byte]))]);
+            split_done = true;
+            break;
+        }
+        acc += n;
+    }
+    let _ = split_done; // offsets at or past the end split into an empty tail
+    let mut tail = CT_P::new();
+    tail.properties = p.properties.clone();
+    if let Some(props) = p.properties.as_mut() {
+        props.sect_pr = None;
+    }
+    tail.runs = tail_runs;
+    Some(tail)
+}
+
+/// SVG PoC patch: append `cur`'s runs to `prev`. Both must be plain
+/// paragraphs (no boundary projections).
+fn merge_simple_paragraphs(prev: &mut CT_P, cur: &CT_P) -> bool {
+    let plain = |p: &CT_P| {
+        p.hyperlinks.is_empty()
+            && p.comment_ranges.is_empty()
+            && p.bookmark_markers.is_empty()
+            && p.extra_xml.is_empty()
+            && p.content_controls.is_empty()
+            && p.revisions.is_empty()
+    };
+    if !plain(prev) || !plain(cur) {
+        return false;
+    }
+    prev.runs.extend(cur.runs.iter().cloned());
+    true
 }
