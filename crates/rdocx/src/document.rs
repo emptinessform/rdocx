@@ -1556,6 +1556,27 @@ impl Document {
         self.set_header_footer_part(text, false, HdrFtrType::Default);
     }
 
+    /// Set the default footer to `prefix` followed by a live page number —
+    /// the ubiquitous "Page N" footer.
+    pub fn set_footer_page_number(&mut self, prefix: &str) {
+        use rdocx_oxml::text::Field;
+
+        self.invalidate_layout();
+        let mut hdr_ftr = CT_HdrFtr::new();
+        let mut p = CT_P::new();
+        if !prefix.is_empty() {
+            p.add_run(prefix);
+        }
+        let mut run = CT_R::new("");
+        run.content = vec![RunContent::Field(Field::new(" PAGE ", "1"))];
+        p.runs.push(run);
+        hdr_ftr.paragraphs.push(p);
+        let Ok(xml) = Self::serialize_hdr_ftr(&hdr_ftr, false) else {
+            return;
+        };
+        self.install_hdr_ftr_part(xml, false, HdrFtrType::Default);
+    }
+
     /// Set the first-page header text.
     pub fn set_first_page_header(&mut self, text: &str) {
         self.invalidate_layout();
