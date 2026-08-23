@@ -616,6 +616,17 @@ impl<'a> TableRef<'a> {
     }
 
     /// Get the table style ID, if set.
+    /// Grid column widths in twips (empty when the table has no tblGrid)
+    /// — the numbers a column-resize UI needs to turn a drag delta into
+    /// a Table::set_column_width call.
+    pub fn grid_column_widths(&self) -> Vec<i32> {
+        self.inner
+            .grid
+            .as_ref()
+            .map(|grid| grid.columns.iter().map(|c| c.width.0).collect())
+            .unwrap_or_default()
+    }
+
     pub fn style_id(&self) -> Option<&str> {
         self.inner
             .properties
