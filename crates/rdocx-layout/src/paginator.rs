@@ -1184,7 +1184,11 @@ fn draw_note(
     top: f64,
     page_number: usize,
 ) -> f64 {
-    let baseline = top + note.lines.get(first).map_or(0.0, |line| line.ascent);
+    let baseline = top
+        + note
+            .lines
+            .get(first)
+            .map_or(0.0, |line| line.line_gap + line.ascent);
 
     // A continuation does not repeat the marker.
     if !continued {
@@ -1209,7 +1213,7 @@ fn draw_note(
 
     let mut cursor_y = top;
     for line in note.lines.iter().skip(first).take(count) {
-        let line_baseline = cursor_y + line.ascent;
+        let line_baseline = cursor_y + line.line_gap + line.ascent;
         let mut x = geometry.margin_left + NOTE_INDENT;
         for item in &line.items {
             let (segment, advance) = match item {
@@ -1985,7 +1989,7 @@ fn render_paragraph_lines(
     // first line down. `content_height` already counts the same offset.
     let mut y = start_y + para.content_offset_top;
     for line in lines {
-        let baseline_y = geometry.margin_top + y + line.ascent;
+        let baseline_y = geometry.margin_top + y + line.line_gap + line.ascent;
 
         // Compute x offset based on justification
         let text_width: f64 = line.items.iter().map(|item| item.width()).sum();
@@ -2173,7 +2177,7 @@ fn render_paragraph_lines(
                 LineItem::Tab { width, leader } => {
                     if let Some(leader_seg) = leader {
                         // Render the pre-shaped leader text
-                        let baseline_y = geometry.margin_top + y + line.ascent;
+                        let baseline_y = geometry.margin_top + y + line.line_gap + line.ascent;
                         elements.push(PositionedElement::Text(GlyphRun {
                             origin: Point { x, y: baseline_y },
                             font_id: leader_seg.font_id,
