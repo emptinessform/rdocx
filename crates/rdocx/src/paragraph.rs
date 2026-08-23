@@ -223,6 +223,58 @@ impl<'a> Paragraph<'a> {
         self.inner.runs.push(run);
     }
 
+    /// Wrap the EXISTING runs [run_start, run_end) in an external
+    /// hyperlink relationship — for editors linking selected text (pair
+    /// with [`crate::Document::add_hyperlink_relationship`]).
+    ///
+    /// Returns false without mutation for an empty/out-of-range span or
+    /// one overlapping an existing hyperlink.
+    pub fn wrap_hyperlink(
+        &mut self,
+        run_start: usize,
+        run_end: usize,
+        relationship_id: &str,
+    ) -> bool {
+        if run_start >= run_end || run_end > self.inner.runs.len() {
+            return false;
+        }
+        if self
+            .inner
+            .hyperlinks
+            .iter()
+            .any(|h| h.run_start < run_end && h.run_end > run_start)
+        {
+            return false;
+        }
+        self.inner.hyperlinks.push(HyperlinkSpan {
+            rel_id: Some(relationship_id.to_string()),
+            anchor: None,
+            run_start,
+            run_end,
+            extra_attributes: Vec::new(),
+            extra_xml: Vec::new(),
+            preserved_raw_before: None,
+        });
+        true
+    }
+
+    /// Remove the hyperlink span at `index` (the order returned by
+    /// [`ParagraphRef::hyperlink_spans`]), keeping its runs. Conservative
+    /// about unmodeled content — see `CT_P::remove_hyperlink_span`.
+    pub fn unwrap_hyperlink(&mut self, index: usize) -> bool {
+        self.inner.remove_hyperlink_span(index)
+    }
+
+    /// Hyperlink spans as (run_start, run_end, rel_id) — the builder-side
+    /// twin of [`ParagraphRef::hyperlink_spans`].
+    pub fn hyperlink_spans_value(&self) -> Vec<(usize, usize, Option<String>)> {
+        self.inner
+            .hyperlinks
+            .iter()
+            .map(|h| (h.run_start, h.run_end, h.rel_id.clone()))
+            .collect()
+    }
+
     /// Add a run wrapped in an external hyperlink relationship.
     ///
     /// Obtain `relationship_id` from

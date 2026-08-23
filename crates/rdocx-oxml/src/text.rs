@@ -1604,6 +1604,28 @@ impl CT_P {
 
     /// Insert a direct run while keeping every paragraph boundary projection aligned.
     #[doc(hidden)]
+    /// Remove the hyperlink span at `index`, keeping its runs in place.
+    ///
+    /// Conservative: refuses spans that carry unmodeled raw XML, and
+    /// paragraphs whose tracked revisions are bound to this or a later
+    /// hyperlink (removal would leave their slots pointing at the wrong
+    /// span).
+    pub fn remove_hyperlink_span(&mut self, index: usize) -> bool {
+        let Some(h) = self.hyperlinks.get(index) else {
+            return false;
+        };
+        if !h.extra_xml.is_empty() || h.preserved_raw_before.is_some() {
+            return false;
+        }
+        if self.revisions.iter().any(|(_, slot, _)| {
+            hyperlink_revision_index(*slot).is_some_and(|i| i >= index)
+        }) {
+            return false;
+        }
+        self.hyperlinks.remove(index);
+        true
+    }
+
     pub fn insert_unwrapped_run(&mut self, run_index: usize, run: CT_R) -> bool {
         if run_index > self.runs.len() {
             return false;
