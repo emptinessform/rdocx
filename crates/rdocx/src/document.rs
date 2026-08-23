@@ -2215,31 +2215,42 @@ impl Document {
         self.numbering.get_or_insert_with(CT_Numbering::new)
     }
 
+    /// Find or create the document's shared bullet/numbered list
+    /// definition and return its numId — for toggling existing paragraphs
+    /// into a list (pair with [`crate::Paragraph::set_numbering`]).
+    ///
+    /// The same shared definition `add_bullet_list_item` /
+    /// `add_numbered_list_item` use: the first num whose first level
+    /// renders the requested format, else a freshly created one.
+    pub fn ensure_list_num(&mut self, bullet: bool) -> u32 {
+        self.invalidate_layout();
+        let want = if bullet {
+            rdocx_oxml::numbering::ST_NumberFormat::Bullet
+        } else {
+            rdocx_oxml::numbering::ST_NumberFormat::Decimal
+        };
+        let numbering = self.ensure_numbering();
+        let existing = numbering.nums.iter().find(|n| {
+            numbering
+                .get_abstract_num_for(n.num_id)
+                .map(|a| a.levels.first().and_then(|l| l.num_fmt) == Some(want))
+                .unwrap_or(false)
+        });
+        if let Some(existing) = existing {
+            existing.num_id
+        } else if bullet {
+            numbering.add_bullet_list()
+        } else {
+            numbering.add_numbered_list()
+        }
+    }
+
     /// Add a bullet list item at the given indentation level (0-based).
     ///
     /// If no bullet list definition exists yet, one is created automatically.
     /// Returns a mutable `Paragraph` for further configuration.
     pub fn add_bullet_list_item(&mut self, text: &str, level: u32) -> Paragraph<'_> {
-        self.invalidate_layout();
-        // Find or create a bullet list numId
-        let num_id = {
-            let numbering = self.ensure_numbering();
-            // Look for an existing bullet list
-            let existing = numbering.nums.iter().find(|n| {
-                numbering
-                    .get_abstract_num_for(n.num_id)
-                    .map(|a| {
-                        a.levels.first().and_then(|l| l.num_fmt)
-                            == Some(rdocx_oxml::numbering::ST_NumberFormat::Bullet)
-                    })
-                    .unwrap_or(false)
-            });
-            if let Some(existing) = existing {
-                existing.num_id
-            } else {
-                numbering.add_bullet_list()
-            }
-        };
+        let num_id = self.ensure_list_num(true);
 
         let mut p = CT_P::new();
         if !text.is_empty() {
@@ -2264,26 +2275,7 @@ impl Document {
     /// If no numbered list definition exists yet, one is created automatically.
     /// Returns a mutable `Paragraph` for further configuration.
     pub fn add_numbered_list_item(&mut self, text: &str, level: u32) -> Paragraph<'_> {
-        self.invalidate_layout();
-        // Find or create a numbered list numId
-        let num_id = {
-            let numbering = self.ensure_numbering();
-            // Look for an existing numbered list
-            let existing = numbering.nums.iter().find(|n| {
-                numbering
-                    .get_abstract_num_for(n.num_id)
-                    .map(|a| {
-                        a.levels.first().and_then(|l| l.num_fmt)
-                            == Some(rdocx_oxml::numbering::ST_NumberFormat::Decimal)
-                    })
-                    .unwrap_or(false)
-            });
-            if let Some(existing) = existing {
-                existing.num_id
-            } else {
-                numbering.add_numbered_list()
-            }
-        };
+        let num_id = self.ensure_list_num(false);
 
         let mut p = CT_P::new();
         if !text.is_empty() {
