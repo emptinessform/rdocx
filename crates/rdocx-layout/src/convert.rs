@@ -91,15 +91,39 @@ pub(crate) fn line_break_params(properties: &CT_PPr, available_width: f64) -> Li
         line_spacing: line_spacing(properties),
         jc: alignment(properties.jc),
         wrap: true,
+        // The "font-natural" sentinel marks LibreOffice-convention layout
+        // (non-Word frontends): Korean text then wraps by word (어절), not
+        // by syllable as Word does.
+        hangul_word_wrap: properties.line_rule.as_deref() == Some("font-natural"),
     }
 }
 
-pub(crate) fn text_segments(segment: TextSegment) -> Vec<InlineItem> {
-    let mut ranges = Vec::new();
+/// Hangul as LibreOffice word wrap sees it (어절 단위 줄바꿈).
+fn is_hangul(c: char) -> bool {
+    matches!(u32::from(c),
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF)
+}
+
+pub(crate) fn text_segments(segment: TextSegment, hangul_word_wrap: bool) -> Vec<InlineItem> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
     for (end, _) in linebreaks(&segment.text) {
         if end > start {
-            ranges.push((start, end));
+            // 한글 어절 단위 모드: 음절 사이 분할점은 직전 구간과 병합해
+            // 어절이 하나의 아이템으로 남게 한다 (아이템 경계 = 줄바꿈 기회).
+            let suppress = hangul_word_wrap
+                && end < segment.text.len()
+                && segment.text[..end].chars().next_back().is_some_and(is_hangul)
+                && segment.text[end..].chars().next().is_some_and(is_hangul);
+            if suppress {
+                if let Some(last) = ranges.last_mut() {
+                    last.1 = end;
+                } else {
+                    ranges.push((start, end));
+                }
+            } else {
+                ranges.push((start, end));
+            }
             start = end;
         }
     }
@@ -321,7 +345,7 @@ mod tests {
             field_kind: None,
             note: None,
         };
-        let items = text_segments(segment);
+        let items = text_segments(segment, false);
         assert_eq!(items.len(), 2);
         let InlineItem::Text(first) = &items[0] else {
             panic!("expected a text segment");
