@@ -311,7 +311,16 @@ pub struct FontData {
     pub bold: bool,
     /// Whether this is an italic variant.
     pub italic: bool,
+    /// Italic was requested but the face is upright — renderers must
+    /// synthesize an oblique by skewing glyphs with
+    /// [`SYNTHETIC_ITALIC_TAN`].
+    pub synthetic_italic: bool,
 }
+
+/// Horizontal shear applied when synthesizing an oblique for a font with no
+/// italic face: tan(20°), the DirectWrite oblique-simulation convention that
+/// Windows renderers (including LibreOffice via DWrite) use.
+pub const SYNTHETIC_ITALIC_TAN: f64 = 0.363_970_234_266_202_36;
 
 /// Document metadata to pass through to PDF output.
 #[derive(Debug, Clone, Default)]
