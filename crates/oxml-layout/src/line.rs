@@ -343,10 +343,15 @@ pub fn break_into_lines(
         match seg {
             BreakableSegment::Items(seg_items) => {
                 let seg_width: f64 = seg_items.iter().map(inline_item_width).sum();
+                // Trailing whitespace may overflow the line (it is invisible
+                // at the margin — LibreOffice, Word, and CSS all agree), so
+                // the fit test discounts it. The full width still accrues to
+                // the line so inter-word spacing stays intact mid-line.
+                let fit_width = seg_width - trailing_whitespace_width(seg_items);
 
                 if params.wrap
                     && !current_items.is_empty()
-                    && current_width + seg_width > line_avail + 0.01
+                    && current_width + fit_width > line_avail + 0.01
                 {
                     // Finish current line
                     let indent = line_indent_at(params, line_index, is_first_line);
@@ -972,6 +977,38 @@ fn subsequent_line_indent(params: &LineBreakParams) -> f64 {
     params.ind_left
 }
 
+/// Width of the whitespace run at the very end of a breakable group.
+///
+/// Only used to discount the fit test — trailing whitespace hangs into the
+/// margin instead of forcing a wrap.
+fn trailing_whitespace_width(items: &[InlineItem]) -> f64 {
+    let mut total = 0.0;
+    for item in items.iter().rev() {
+        let InlineItem::Text(seg) = item else { break };
+        let chars: Vec<char> = seg.text.chars().collect();
+        let trailing = chars
+            .iter()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .count();
+        if trailing == 0 {
+            break;
+        }
+        if seg.glyph_ids.len() == chars.len() && seg.advances.len() == chars.len() {
+            total += seg.advances[chars.len() - trailing..].iter().sum::<f64>();
+        } else if trailing == chars.len() {
+            total += seg.width;
+        } else {
+            // 글리프-문자 정렬을 알 수 없으면 보수적으로 중단.
+            break;
+        }
+        if trailing < chars.len() {
+            break;
+        }
+    }
+    total
+}
+
 /// Compute line height based on spacing rules.
 fn effective_line_gap(ascent: f64, descent: f64, natural_height: f64) -> f64 {
     (natural_height - ascent - descent).max(0.0)
@@ -1524,5 +1561,30 @@ mod tests {
         };
         assert_eq!((*width, *height), (80.0, 40.0));
         assert_eq!(actual, &group);
+    }
+
+    /// 행말 공백은 폭 계산에서 오버플로가 허용된다 (LO·Word·CSS 공통 관행).
+    /// 어절+공백 묶음의 꼬리 공백이 적합 판정에 포함되면, 면도날 경계에서
+    /// 한 어절 일찍 줄이 꺾인다.
+    #[test]
+    fn trailing_space_does_not_force_a_wrap() {
+        let mut fm = deterministic_font_manager();
+        let word = shaped_text_segment(&mut fm, "aaa", 0.0);
+        let space = shaped_text_segment(&mut fm, " ", 0.0);
+        let (w, sp) = (word.width, space.width);
+
+        // "aaa aaa " — 두 번째 어절의 꼬리 공백만 넘치는 폭.
+        let seg = shaped_text_segment(&mut fm, "aaa aaa ", 0.0);
+        let params = LineBreakParams {
+            available_width: w + sp + w + sp * 0.5,
+            ..Default::default()
+        };
+        let lines = break_into_lines(&[InlineItem::Text(seg)], &params, &fm)
+            .expect("break_into_lines");
+        assert_eq!(
+            lines.len(),
+            1,
+            "trailing space must overflow, not wrap (w={w}, sp={sp})"
+        );
     }
 }
