@@ -91,6 +91,7 @@ pub(crate) fn line_break_params(properties: &CT_PPr, available_width: f64) -> Li
         line_spacing: line_spacing(properties),
         jc: alignment(properties.jc),
         wrap: true,
+        default_tab_interval_pt: 36.0, // Word 기본 0.5"
         // The "font-natural" sentinel marks LibreOffice-convention layout
         // (non-Word frontends): Korean text then wraps by word (어절), not
         // by syllable as Word does.
