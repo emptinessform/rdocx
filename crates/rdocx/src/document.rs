@@ -3913,6 +3913,99 @@ impl Document {
         removed
     }
 
+    /// SVG PoC patch: resize the `index`-th inline image in document order
+    /// (same counting as [`Self::remove_inline_image`]) to `width_emu`,
+    /// keeping the aspect ratio. Anchored drawings are refused. The
+    /// drawing's captured round-trip XML is dropped so the new extent
+    /// serializes (the payload is rebuilt from the structured fields).
+    pub fn resize_inline_image(&mut self, index: usize, width_emu: i64) -> bool {
+        use rdocx_oxml::table::CellContent;
+        use rdocx_oxml::text::RunContent;
+        use rdocx_oxml::units::Emu;
+
+        if width_emu <= 0 {
+            return false;
+        }
+
+        fn resize_in_paragraph(
+            p: &mut CT_P,
+            seen: &mut usize,
+            target: usize,
+            w: i64,
+            resized: &mut bool,
+        ) -> bool {
+            for r in &mut p.runs {
+                for content in &mut r.content {
+                    if let RunContent::Drawing(d) = content {
+                        if *seen == target {
+                            if let Some(inline) = d.inline.as_mut() {
+                                if inline.extent_cx.0 > 0 {
+                                    let h = inline.extent_cy.0 as f64 * w as f64
+                                        / inline.extent_cx.0 as f64;
+                                    inline.extent_cx = Emu(w);
+                                    inline.extent_cy = Emu(h.round() as i64);
+                                    inline.raw_xml = None;
+                                    *resized = true;
+                                }
+                            }
+                            return true;
+                        }
+                        *seen += 1;
+                    }
+                }
+            }
+            false
+        }
+        fn resize_in_table(
+            t: &mut rdocx_oxml::table::CT_Tbl,
+            seen: &mut usize,
+            target: usize,
+            w: i64,
+            resized: &mut bool,
+        ) -> bool {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    for content in &mut cell.content {
+                        let hit = match content {
+                            CellContent::Paragraph(p) => {
+                                resize_in_paragraph(p, seen, target, w, resized)
+                            }
+                            CellContent::Table(nested) => {
+                                resize_in_table(nested, seen, target, w, resized)
+                            }
+                            CellContent::ContentControl(_) => false,
+                        };
+                        if hit {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        let mut seen = 0usize;
+        let mut resized = false;
+        for content in &mut self.document.body.content {
+            let hit = match content {
+                BodyContent::Paragraph(p) => {
+                    resize_in_paragraph(p, &mut seen, index, width_emu, &mut resized)
+                }
+                BodyContent::Table(t) => {
+                    resize_in_table(t, &mut seen, index, width_emu, &mut resized)
+                }
+                _ => false,
+            };
+            if hit {
+                break;
+            }
+        }
+        if resized {
+            self.invalidate_layout();
+        }
+        resized
+    }
+
     /// SVG PoC patch: shared access to a top-level table for the structure
     /// ops below. Tables carrying unmodeled raw XML or content controls are
     /// refused conservatively — inserting/removing rows would shift the
