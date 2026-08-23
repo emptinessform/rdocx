@@ -1444,6 +1444,25 @@ impl Document {
         self.document.body.remove(index).is_some()
     }
 
+    /// Move the content at body index `from` to index `to` (both in the
+    /// current body order; the item ends up at index `to` after the move).
+    ///
+    /// Returns `false` if either index is out of bounds; a same-index move
+    /// is a no-op that returns `true`.
+    pub fn move_content(&mut self, from: usize, to: usize) -> bool {
+        let len = self.document.body.content.len();
+        if from >= len || to >= len {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+        self.invalidate_layout();
+        let item = self.document.body.content.remove(from);
+        self.document.body.content.insert(to, item);
+        true
+    }
+
     // ---- Image support ----
 
     /// Add an inline image to the document.
