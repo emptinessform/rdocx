@@ -14241,10 +14241,20 @@ mod tests {
             if run.origin.y > first + 0.01 {
                 wrapped = true;
             }
-            let right_edge = run.origin.x + run.advances.iter().sum::<f64>();
+            // Trailing whitespace at a wrapped line end may hang into the
+            // margin (it has no ink) — measure the reach of visible text.
+            let ws_count = run
+                .text
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .count()
+                .min(run.advances.len());
+            let trailing_ws: f64 = run.advances[run.advances.len() - ws_count..].iter().sum();
+            let right_edge = run.origin.x + run.advances.iter().sum::<f64>() - trailing_ws;
             assert!(
                 right_edge <= right_margin + 0.01,
-                "note text reaches {right_edge}, past the right margin {right_margin}"
+                "note ink reaches {right_edge}, past the right margin {right_margin}"
             );
         }
         assert!(wrapped, "the note must wrap for this test to mean anything");
