@@ -981,12 +981,20 @@ fn render_positioned_glyph_run(
         {
             // Transform: translate to glyph position, scale from font units to points,
             // and flip Y (font coordinates are Y-up, pixmap is Y-down)
-            let glyph_transform = transform
+            let mut glyph_transform = transform
                 .pre_translate(
                     (x + x_offsets.get(i).copied().unwrap_or(0.0)) as f32,
                     (y - y_offsets.get(i).copied().unwrap_or(0.0)) as f32,
                 )
                 .pre_scale(scale as f32, -(scale as f32));
+            if font_data.synthetic_italic {
+                // No italic face exists: slant the upright outline. In glyph
+                // space (Y-up) x' = x + tan·y leans ascenders to the right.
+                glyph_transform = glyph_transform.pre_concat(Transform::from_skew(
+                    oxml_layout::SYNTHETIC_ITALIC_TAN as f32,
+                    0.0,
+                ));
+            }
 
             pixmap.fill_path(&path, &paint, FillRule::Winding, glyph_transform, mask);
         }
