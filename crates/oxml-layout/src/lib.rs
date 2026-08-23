@@ -18,7 +18,7 @@ pub use line::{
 pub use output::{
     Color, Diagnostic, DocumentMetadata, Effect, FieldKind, FontData, FontId, GlyphRun,
     GroupElement, LayoutResult, MediaId, OutlineEntry, PageFrame, PathElement, Point,
-    PositionedElement, Rect, SourceNodeId, SourceSpan, SYNTHETIC_ITALIC_TAN, walk,
+    PositionedElement, Rect, SourceNodeId, SourceSpan, walk,
 };
 pub use paint::{GradientStop, LineCap, LineJoin, Paint, Stroke};
 pub use path::{FillRule, Path, PathCommand};

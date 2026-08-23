@@ -159,9 +159,6 @@ struct LoadedFont {
     family: String,
     bold: bool,
     italic: bool,
-    /// Italic was requested but the resolved face is upright — renderers
-    /// should synthesize an oblique (skew) for this font.
-    synthetic_italic: bool,
     data: Arc<[u8]>,
     face_index: u32,
     units_per_em: u16,
@@ -848,15 +845,6 @@ impl FontManager {
             })
             .unwrap_or_else(|| family_name.to_string());
 
-        // Italic requested but the face fontdb picked is upright: the family
-        // has no italic variant, so renderers must slant it themselves.
-        let face_is_italic = self
-            .db
-            .face(db_id)
-            .map(|f| f.style != fontdb::Style::Normal)
-            .unwrap_or(false);
-        let synthetic_italic = italic && !face_is_italic;
-
         let idx = self.fonts.len();
         self.fonts.push(LoadedFont {
             db_id,
@@ -864,7 +852,6 @@ impl FontManager {
             family: actual_family,
             bold,
             italic,
-            synthetic_italic,
             data,
             face_index,
             units_per_em,
@@ -987,7 +974,6 @@ impl FontManager {
             face_index: font.face_index,
             bold: font.bold,
             italic: font.italic,
-            synthetic_italic: font.synthetic_italic,
         })
     }
 
@@ -1002,7 +988,6 @@ impl FontManager {
                 face_index: f.face_index,
                 bold: f.bold,
                 italic: f.italic,
-                synthetic_italic: f.synthetic_italic,
             })
             .collect()
     }

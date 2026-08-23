@@ -941,19 +941,11 @@ fn emit_elements(content: &mut Content, elements: &[PositionedElement], state: &
                     content.begin_text();
                     content.set_font(Name(font_name.as_bytes()), run.font_size as f32);
 
-                    // Cancel the page flip so glyphs remain upright. When the
-                    // face has no italic variant, shear via the text matrix's
-                    // c component to synthesize an oblique (same slant as the
-                    // raster backend).
-                    let skew = if prepared.font_data.synthetic_italic {
-                        oxml_layout::SYNTHETIC_ITALIC_TAN as f32
-                    } else {
-                        0.0
-                    };
+                    // Cancel the page flip so glyphs remain upright.
                     content.set_text_matrix([
                         1.0,
                         0.0,
-                        skew,
+                        0.0,
                         -1.0,
                         run.origin.x as f32,
                         run.origin.y as f32,
@@ -2283,7 +2275,6 @@ mod tests {
                 face_index: 0,
                 bold: false,
                 italic: false,
-                synthetic_italic: false,
             },
             subset_bytes: Vec::new(),
             remapper,
