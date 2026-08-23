@@ -267,6 +267,10 @@ pub struct LineBreakParams {
     pub jc: Option<Align>,
     /// Whether width overflow may create automatic line breaks.
     pub wrap: bool,
+    /// Interval of implicit tab stops past the last explicit one, in
+    /// points. Word uses 36pt (0.5"); LibreOffice/ODF uses 35.433pt
+    /// (1.25cm). The default stays Word's.
+    pub default_tab_interval_pt: f64,
     /// Korean word wrap: suppress break opportunities between Hangul
     /// characters so lines break at spaces (어절 단위), the LibreOffice
     /// convention for Korean text. Word keeps the UAX #14 default
@@ -296,6 +300,7 @@ impl Default for LineBreakParams {
             line_spacing: LineSpacing::Single,
             jc: None,
             wrap: true,
+            default_tab_interval_pt: 36.0,
             hangul_word_wrap: false,
         }
     }
@@ -376,6 +381,8 @@ pub fn break_into_lines(
                     let indent = line_indent_at(params, line_index, is_first_line);
                     let line_gap =
                         effective_line_gap(current_ascent, current_descent, current_natural_height);
+                    finalize_tab_alignment(&mut current_items, &params.tab_stops);
+                    current_width = current_items.iter().map(LineItem::width).sum();
                     lines.push(LayoutLine {
                         items: std::mem::take(&mut current_items),
                         width: current_width,
@@ -403,10 +410,14 @@ pub fn break_into_lines(
                     line_avail = line_width_at(params, line_index, false);
                 }
 
-                // Add segment items to current line
-                for item in &seg_items {
+                // Add segment items to current line. Tabs are resolved
+                // against the line position BEFORE the tab itself, and the
+                // resolved width (not the 36pt placeholder) accrues — with
+                // Word's 36pt default interval the two mistakes cancelled
+                // exactly, which is why this only surfaced with other
+                // intervals.
+                for item in seg_items {
                     let (w, a, d, natural_height, font_size) = item_metrics(item);
-                    current_width += w;
                     if a > current_ascent {
                         current_ascent = a;
                     }
@@ -421,13 +432,20 @@ pub fn break_into_lines(
                     } else if let InlineItem::MultilingualText(seg) = item {
                         font_ctx = Some((seg.font_id(), seg.base().font_size));
                     }
-                    current_items.push(inline_to_line_item(
+                    let line_item = inline_to_line_item(
                         item,
                         current_width,
                         &params.tab_stops,
+                        params.default_tab_interval_pt,
                         fm,
                         font_ctx,
-                    ));
+                    );
+                    current_width += if matches!(item, InlineItem::Tab) {
+                        line_item.width()
+                    } else {
+                        w
+                    };
+                    current_items.push(line_item);
                 }
             }
             BreakableSegment::Hyphenated(boxed) => {
@@ -571,6 +589,8 @@ pub fn break_into_lines(
                 let indent = line_indent_at(params, line_index, is_first_line);
                 let line_gap =
                     effective_line_gap(current_ascent, current_descent, current_natural_height);
+                finalize_tab_alignment(&mut current_items, &params.tab_stops);
+                current_width = current_items.iter().map(LineItem::width).sum();
                 lines.push(LayoutLine {
                     items: std::mem::take(&mut current_items),
                     width: current_width,
@@ -603,6 +623,8 @@ pub fn break_into_lines(
     // Flush remaining items as the last line
     let indent = line_indent_at(params, line_index, is_first_line);
     let line_gap = effective_line_gap(current_ascent, current_descent, current_natural_height);
+    finalize_tab_alignment(&mut current_items, &params.tab_stops);
+    let current_width: f64 = current_items.iter().map(LineItem::width).sum();
     lines.push(LayoutLine {
         items: current_items,
         width: current_width,
@@ -1293,6 +1315,7 @@ fn inline_to_line_item(
     item: &InlineItem,
     current_x: f64,
     tab_stops: &[TabStop],
+    default_tab_interval: f64,
     fm: &FontManager,
     font_ctx: Option<(FontId, f64)>,
 ) -> LineItem {
@@ -1303,7 +1326,7 @@ fn inline_to_line_item(
         InlineItem::MultilingualText(seg) => LineItem::MultilingualText(seg.clone()),
         InlineItem::Marker(seg) => LineItem::Marker(seg.clone()),
         InlineItem::Tab => {
-            let (tab_width, leader_char) = resolve_tab_width(current_x, tab_stops);
+            let (tab_width, leader_char) = resolve_tab_width(current_x, tab_stops, default_tab_interval);
             let leader = leader_char.and_then(|ch| shape_leader(fm, font_ctx, ch, tab_width));
             LineItem::Tab {
                 width: tab_width,
@@ -1422,7 +1445,11 @@ fn shape_leader(
 }
 
 /// Resolve tab stop width and leader character based on current x position and defined stops.
-fn resolve_tab_width(current_x: f64, tab_stops: &[TabStop]) -> (f64, Option<char>) {
+fn resolve_tab_width(
+    current_x: f64,
+    tab_stops: &[TabStop],
+    default_interval: f64,
+) -> (f64, Option<char>) {
     // Find the next tab stop after the current position
     for stop in tab_stops {
         let stop_pos = stop.pos_pt;
@@ -1444,8 +1471,7 @@ fn resolve_tab_width(current_x: f64, tab_stops: &[TabStop]) -> (f64, Option<char
             return (width, leader);
         }
     }
-    // Default tab stops every 0.5 inches (36pt)
-    let default_interval = 36.0;
+    // Implicit stops every `default_interval` points past explicit ones.
     let next_stop = ((current_x / default_interval).floor() + 1.0) * default_interval;
     (next_stop - current_x, None)
 }
@@ -1543,6 +1569,38 @@ fn trailing_whitespace_width(items: &[InlineItem]) -> f64 {
         }
     }
     total
+}
+
+/// Re-resolve centre/right tab widths once the following content is known.
+///
+/// A centre or right tab stop positions the text AFTER the tab around/at the
+/// stop, which a single forward pass cannot know. Left and implicit-interval
+/// tabs keep their forward-resolved widths.
+fn finalize_tab_alignment(items: &mut [LineItem], tab_stops: &[TabStop]) {
+    let mut x = 0.0;
+    for i in 0..items.len() {
+        if matches!(items[i], LineItem::Tab { .. }) {
+            let stop = tab_stops.iter().find(|s| s.pos_pt > x + 1e-6);
+            if let Some(stop) = stop {
+                if matches!(stop.align, TabAlign::Center | TabAlign::Right | TabAlign::Decimal) {
+                    let following: f64 = items[i + 1..]
+                        .iter()
+                        .take_while(|it| !matches!(it, LineItem::Tab { .. }))
+                        .map(LineItem::width)
+                        .sum();
+                    let target = match stop.align {
+                        TabAlign::Center => stop.pos_pt - following / 2.0,
+                        _ => stop.pos_pt - following,
+                    };
+                    let new_width = (target - x).max(0.0);
+                    if let LineItem::Tab { width, .. } = &mut items[i] {
+                        *width = new_width;
+                    }
+                }
+            }
+        }
+        x += items[i].width();
+    }
 }
 
 /// Compute line height based on spacing rules.
@@ -2337,14 +2395,14 @@ mod tests {
             align: TabAlign::Left,
             leader: None,
         }];
-        let (w, leader) = resolve_tab_width(36.0, &stops);
+        let (w, leader) = resolve_tab_width(36.0, &stops, 36.0);
         assert!((w - 36.0).abs() < 0.01);
         assert!(leader.is_none());
     }
 
     #[test]
     fn default_tab_stops() {
-        let (w, _) = resolve_tab_width(10.0, &[]);
+        let (w, _) = resolve_tab_width(10.0, &[], 36.0);
         assert!((w - 26.0).abs() < 0.01); // next stop at 36pt
     }
 
@@ -2355,7 +2413,7 @@ mod tests {
             align: TabAlign::Right,
             leader: Some(TabLeader::Dot),
         }];
-        let (w, leader) = resolve_tab_width(100.0, &stops);
+        let (w, leader) = resolve_tab_width(100.0, &stops, 36.0);
         assert!((w - 300.0).abs() < 0.01);
         assert_eq!(leader, Some('.'));
     }
@@ -2535,7 +2593,7 @@ mod tests {
             leader: Some(TabLeader::Dot),
         };
 
-        let item = inline_to_line_item(&InlineItem::Tab, 12.0, &[stop], &fm, Some((font_id, 12.0)));
+        let item = inline_to_line_item(&InlineItem::Tab, 12.0, &[stop], 36.0, &fm, Some((font_id, 12.0)));
 
         let LineItem::Tab {
             width,
@@ -2561,6 +2619,7 @@ mod tests {
             },
             0.0,
             &[],
+            36.0,
             &deterministic_font_manager(),
             None,
         );
