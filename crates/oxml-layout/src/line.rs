@@ -255,6 +255,11 @@ pub struct LineBreakParams {
     pub jc: Option<Align>,
     /// Whether width overflow may create automatic line breaks.
     pub wrap: bool,
+    /// Korean word wrap: suppress break opportunities between Hangul
+    /// characters so lines break at spaces (어절 단위), the LibreOffice
+    /// convention for Korean text. Word keeps the UAX #14 default
+    /// (syllable breaks), so DOCX layout leaves this false.
+    pub hangul_word_wrap: bool,
     /// Extra width kept clear at the start of individual lines, by line index.
     ///
     /// This is how a floating drawing pushes text aside. An empty vector, the
@@ -279,6 +284,7 @@ impl Default for LineBreakParams {
             line_spacing: LineSpacing::Single,
             jc: None,
             wrap: true,
+            hangul_word_wrap: false,
         }
     }
 }
@@ -331,7 +337,7 @@ pub fn break_into_lines(
     }
 
     // Build breakable segments from inline items
-    let segments = build_breakable_segments(items, fm)?;
+    let segments = build_breakable_segments(items, fm, params.hangul_word_wrap)?;
 
     for seg in &segments {
         match seg {
@@ -480,6 +486,7 @@ enum ForcedBreakType {
 fn build_breakable_segments(
     items: &[InlineItem],
     fm: &FontManager,
+    hangul_word_wrap: bool,
 ) -> Result<Vec<BreakableSegment>> {
     let mut segments = Vec::new();
     let mut current_group: Vec<InlineItem> = Vec::new();
@@ -520,7 +527,7 @@ fn build_breakable_segments(
                     continue;
                 }
                 // Use unicode-linebreak to find break opportunities within text
-                let breaks = split_text_at_break_opportunities(seg);
+                let breaks = split_text_at_break_opportunities(seg, hangul_word_wrap);
 
                 for tb in &breaks {
                     let chunk = &seg.text[tb.start..tb.end];
@@ -634,7 +641,21 @@ struct TextBreakInfo {
     is_break: bool,
 }
 
-fn split_text_at_break_opportunities(seg: &TextSegment) -> Vec<TextBreakInfo> {
+/// Hangul as ODF/LibreOffice word wrap sees it: syllables and jamo cluster
+/// into 어절 and only break at surrounding whitespace.
+fn is_hangul(c: char) -> bool {
+    matches!(u32::from(c),
+        0x1100..=0x11FF   // Hangul Jamo
+        | 0x3130..=0x318F // Hangul Compatibility Jamo
+        | 0xA960..=0xA97F // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7FF // Hangul Syllables + Jamo Extended-B
+    )
+}
+
+fn split_text_at_break_opportunities(
+    seg: &TextSegment,
+    hangul_word_wrap: bool,
+) -> Vec<TextBreakInfo> {
     use unicode_linebreak::{BreakOpportunity, linebreaks};
 
     let text = &seg.text;
@@ -650,10 +671,27 @@ fn split_text_at_break_opportunities(seg: &TextSegment) -> Vec<TextBreakInfo> {
             continue;
         }
 
-        let is_break = matches!(
+        let mut is_break = matches!(
             opportunity,
             BreakOpportunity::Allowed | BreakOpportunity::Mandatory
         );
+
+        // Korean word wrap (어절 단위): drop UAX #14's inter-syllable break
+        // opportunities. Breaks at whitespace survive because the character
+        // before the boundary is then a space, not Hangul.
+        if is_break
+            && hangul_word_wrap
+            && opportunity == BreakOpportunity::Allowed
+            && byte_pos < text.len()
+        {
+            let before = text[..byte_pos].chars().next_back();
+            let after = text[byte_pos..].chars().next();
+            if let (Some(b), Some(a)) = (before, after) {
+                if is_hangul(b) && is_hangul(a) {
+                    is_break = false;
+                }
+            }
+        }
 
         breaks.push(TextBreakInfo {
             start: last_start,
@@ -1364,6 +1402,7 @@ mod tests {
         let params = LineBreakParams {
             available_width: 100.0,
             wrap: false,
+            hangul_word_wrap: false,
             ..Default::default()
         };
 

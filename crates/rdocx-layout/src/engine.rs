@@ -3319,6 +3319,8 @@ fn layout_paragraph_with_source_and_table(
     }
 
     // Convert paragraph properties to layout values
+    let hangul_word_wrap =
+        effective_ppr.line_rule.as_deref() == Some("font-natural");
     let space_before = effective_ppr.space_before.map(|t| t.to_pt()).unwrap_or(0.0);
     let space_after = effective_ppr.space_after.map(|t| t.to_pt()).unwrap_or(0.0);
     let ind_left = effective_ppr.ind_left.map(|t| t.to_pt()).unwrap_or(0.0);
@@ -3606,7 +3608,7 @@ fn layout_paragraph_with_source_and_table(
                         hyperlink_url: current_hyperlink_url.clone(),
                         field_kind: None,
                         note: None,
-                    }));
+                    }, hangul_word_wrap));
                 }
                 RunContent::Tab => {
                     inline_items.push(InlineItem::Tab);
@@ -3813,7 +3815,7 @@ fn layout_paragraph_with_source_and_table(
                                     hyperlink_url: current_hyperlink_url.clone(),
                                     field_kind,
                                     note: None,
-                                }));
+                                }, hangul_word_wrap));
                             }
                             if let Some(control) = control {
                                 inline_items.push(control);
