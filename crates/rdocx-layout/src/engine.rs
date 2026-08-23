@@ -4755,6 +4755,8 @@ fn layout_paragraph_with_source_and_table(
     }
 
     // Convert paragraph properties to layout values
+    let hangul_word_wrap =
+        effective_ppr.line_rule.as_deref() == Some("font-natural");
     let space_before = effective_ppr.space_before.map(|t| t.to_pt()).unwrap_or(0.0);
     let space_after = effective_ppr.space_after.map(|t| t.to_pt()).unwrap_or(0.0);
     let base_direction = match effective_ppr.bidi {
@@ -5069,7 +5071,17 @@ fn layout_paragraph_with_source_and_table(
                             language: language.clone(),
                         });
                     } else {
-                        inline_items.push(InlineItem::Text(segment));
+                        // 어절 단위 모드에서는 한 세그먼트가 여러 아이템으로
+                        // 쪼개지므로, 다국어 스타일을 추가 인덱스에도 복제한다.
+                        let style = multilingual_styles[&item_index].clone();
+                        for (offset, item) in
+                            convert::text_segments(segment, hangul_word_wrap).into_iter().enumerate()
+                        {
+                            if offset > 0 {
+                                multilingual_styles.insert(item_index + offset, style.clone());
+                            }
+                            inline_items.push(item);
+                        }
                     }
                 }
                 RunContent::Tab => {
@@ -5268,7 +5280,8 @@ fn layout_paragraph_with_source_and_table(
                                             .map_or(0.0, |value| value.to_pt()),
                                     },
                                 );
-                                inline_items.push(InlineItem::Text(TextSegment {
+                                let style = multilingual_styles[&item_index].clone();
+                                for (offset, item) in convert::text_segments(TextSegment {
                                     text,
                                     direction: word_text_direction(segment_rpr.rtl),
                                     source: None,
@@ -5291,7 +5304,16 @@ fn layout_paragraph_with_source_and_table(
                                     hyperlink_url: current_hyperlink_url.clone(),
                                     field_kind,
                                     note: None,
-                                }));
+                                }, hangul_word_wrap)
+                                .into_iter()
+                                .enumerate()
+                                {
+                                    if offset > 0 {
+                                        multilingual_styles
+                                            .insert(item_index + offset, style.clone());
+                                    }
+                                    inline_items.push(item);
+                                }
                             }
                             if let Some(control) = control {
                                 inline_items.push(control);

@@ -105,7 +105,50 @@ pub(crate) fn line_break_params(properties: &CT_PPr, available_width: f64) -> Li
         line_spacing: line_spacing(properties),
         jc: alignment(properties.jc),
         wrap: true,
+        // The "font-natural" sentinel marks LibreOffice-convention layout
+        // (non-Word frontends): Korean text then wraps by word (어절), not
+        // by syllable as Word does.
+        hangul_word_wrap: properties.line_rule.as_deref() == Some("font-natural"),
     }
+}
+
+/// Hangul as LibreOffice word wrap sees it (어절 단위 줄바꿈).
+fn is_hangul(c: char) -> bool {
+    matches!(u32::from(c),
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF)
+}
+
+pub(crate) fn text_segments(segment: TextSegment, hangul_word_wrap: bool) -> Vec<InlineItem> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    for (end, _) in linebreaks(&segment.text) {
+        if end > start {
+            // 한글 어절 단위 모드: 음절 사이 분할점은 직전 구간과 병합해
+            // 어절이 하나의 아이템으로 남게 한다 (아이템 경계 = 줄바꿈 기회).
+            let suppress = hangul_word_wrap
+                && end < segment.text.len()
+                && segment.text[..end].chars().next_back().is_some_and(is_hangul)
+                && segment.text[end..].chars().next().is_some_and(is_hangul);
+            if suppress {
+                if let Some(last) = ranges.last_mut() {
+                    last.1 = end;
+                } else {
+                    ranges.push((start, end));
+                }
+            } else {
+                ranges.push((start, end));
+            }
+            start = end;
+        }
+    }
+    if ranges.is_empty() && !segment.text.is_empty() {
+        ranges.push((0, segment.text.len()));
+    }
+
+    ranges
+        .into_iter()
+        .map(|(start, end)| InlineItem::Text(slice_text_segment(&segment, start, end)))
+        .collect()
 }
 
 pub(crate) fn restore_word_line_heights(lines: &mut [LayoutLine], properties: &CT_PPr) {
@@ -257,6 +300,104 @@ mod tests {
         let params = line_break_params(&CT_PPr::default(), 321.0);
         assert_eq!(params.available_width, 321.0);
         assert!(params.wrap);
+    }
+
+    #[test]
+    fn word_text_preserves_pre_cutover_glyph_slices_at_wrap_boundaries() {
+        use oxml_layout::{Color, FontId};
+
+        let segment = TextSegment {
+            text: "one two".to_string(),
+            source: Some(oxml_layout::SourceSpan {
+                node: oxml_layout::SourceNodeId::new(3).expect("non-zero source"),
+                char_start: 20,
+                char_end: 27,
+            }),
+            font_id: FontId(1),
+            font_size: 12.0,
+            glyph_ids: (1..=7).collect(),
+            advances: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            width: 28.0,
+            ascent: 9.0,
+            descent: 3.0,
+            line_gap: 0.0,
+            color: Color::BLACK,
+            bold: false,
+            italic: false,
+            underline: None,
+            strike: false,
+            dstrike: false,
+            highlight: None,
+            baseline_offset: 0.0,
+            hyperlink_url: None,
+            field_kind: None,
+            note: None,
+        };
+        let items = text_segments(segment, false);
+        assert_eq!(items.len(), 2);
+        let InlineItem::Text(first) = &items[0] else {
+            panic!("expected a text segment");
+        };
+        assert_eq!(first.text, "one ");
+        assert_eq!(first.glyph_ids, vec![1, 2, 3, 4]);
+        assert_eq!(first.width, 10.0);
+        assert_eq!(
+            first.source,
+            Some(oxml_layout::SourceSpan {
+                node: oxml_layout::SourceNodeId::new(3).expect("non-zero source"),
+                char_start: 20,
+                char_end: 24,
+            })
+        );
+        let InlineItem::Text(second) = &items[1] else {
+            panic!("expected a text segment");
+        };
+        assert_eq!(second.source.expect("second source").char_start, 24);
+        assert_eq!(second.source.expect("second source").char_end, 27);
+    }
+
+    #[test]
+    fn word_unicode_split_counts_scalars_instead_of_utf8_bytes() {
+        use oxml_layout::{Color, FontId, SourceNodeId, SourceSpan};
+
+        let segment = TextSegment {
+            text: "A🚀界Z".to_owned(),
+            source: Some(SourceSpan {
+                node: SourceNodeId::new(9).expect("non-zero source"),
+                char_start: 100,
+                char_end: 104,
+            }),
+            font_id: FontId(1),
+            font_size: 12.0,
+            glyph_ids: vec![1, 2, 3, 4],
+            advances: vec![1.0; 4],
+            width: 4.0,
+            ascent: 9.0,
+            descent: 3.0,
+            line_gap: 0.0,
+            color: Color::BLACK,
+            bold: false,
+            italic: false,
+            underline: None,
+            strike: false,
+            dstrike: false,
+            highlight: None,
+            baseline_offset: 0.0,
+            hyperlink_url: None,
+            field_kind: None,
+            note: None,
+        };
+
+        let middle = slice_text_segment(&segment, 1, 8);
+        assert_eq!(middle.text, "🚀界");
+        assert_eq!(
+            middle.source,
+            Some(SourceSpan {
+                node: SourceNodeId::new(9).expect("non-zero source"),
+                char_start: 101,
+                char_end: 103,
+            })
+        );
     }
 
     #[test]
