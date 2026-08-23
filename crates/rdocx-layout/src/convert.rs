@@ -79,6 +79,9 @@ pub(crate) fn underline(value: Option<ST_Underline>) -> Option<Underline> {
 
 pub(crate) fn line_spacing(properties: &CT_PPr) -> LineSpacing {
     match (properties.line_spacing, properties.line_rule.as_deref()) {
+        // Non-Word sentinel used by non-DOCX frontends (e.g. rodf): keep the
+        // shared engine's natural, line-gap-inclusive height untouched.
+        (_, Some("font-natural")) => LineSpacing::Single,
         (Some(spacing), Some("exact")) => LineSpacing::Exact(spacing.to_pt()),
         (Some(spacing), Some("atLeast")) => LineSpacing::AtLeast(spacing.to_pt()),
         (Some(spacing), _) => LineSpacing::Multiple(spacing.0 as f64 / 240.0),
@@ -106,6 +109,13 @@ pub(crate) fn line_break_params(properties: &CT_PPr, available_width: f64) -> Li
 }
 
 pub(crate) fn restore_word_line_heights(lines: &mut [LayoutLine], properties: &CT_PPr) {
+    // "font-natural" opts out of Word line-height emulation entirely: the
+    // shared layout's height (ascent + descent + line gap) and the line's
+    // gap value are preserved so the paginator can seat the gap above the
+    // line, matching font-metric renderers such as LibreOffice.
+    if properties.line_rule.as_deref() == Some("font-natural") {
+        return;
+    }
     for line in lines {
         let natural = line.ascent + line.descent;
         let natural = if natural < 1.0 { 12.0 } else { natural };
