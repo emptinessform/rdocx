@@ -4110,6 +4110,11 @@ impl Document {
         self.document.body.sect_pr.as_ref()
     }
 
+    /// Read-only view of the document body's final section properties.
+    pub fn section_properties(&self) -> Option<&CT_SectPr> {
+        self.document.body.sect_pr.as_ref()
+    }
+
     /// Get a mutable reference to section properties, creating defaults if needed.
     pub fn section_properties_mut(&mut self) -> &mut CT_SectPr {
         self.invalidate_layout();
