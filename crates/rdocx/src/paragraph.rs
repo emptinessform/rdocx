@@ -527,6 +527,13 @@ impl<'a> Paragraph<'a> {
         true
     }
 
+    /// Get this paragraph's list numbering as (num_id, level), if any —
+    /// the builder-side twin of [`ParagraphRef::numbering`].
+    pub fn numbering_value(&self) -> Option<(u32, u32)> {
+        let ppr = self.inner.properties.as_ref()?;
+        Some((ppr.num_id?, ppr.num_ilvl.unwrap_or(0)))
+    }
+
     /// Set space before the paragraph.
     pub fn space_before(mut self, length: Length) -> Self {
         self.set_space_before(length);
