@@ -19,7 +19,7 @@ pub use output::{
     Color, Diagnostic, DocumentMetadata, DocumentStructure, Effect, FieldKind, FontData, FontId,
     GlyphRun, GroupElement, LayoutResult, MediaId, OutlineEntry, PageFrame, PathElement, Point,
     PositionedElement, Rect, SourceNodeId, SourceSpan, StructureId, StructureNode, StructureRole,
-    walk,
+    SYNTHETIC_ITALIC_TAN, walk,
 };
 pub use paint::{GradientStop, LineCap, LineJoin, Paint, Stroke};
 pub use path::{FillRule, Path, PathCommand};
