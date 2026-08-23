@@ -3719,6 +3719,117 @@ impl Document {
         Some(t)
     }
 
+    /// SVG PoC patch: merge the horizontally adjacent cells
+    /// [col, col + count) of one row into the first, Word style: the
+    /// target's gridSpan becomes the sum of the merged spans (widths sum
+    /// too when present), the following cells' contents are appended as
+    /// paragraphs, and the merged-away cells are removed. Cells involved
+    /// in a vertical merge or carrying unmodeled XML are refused.
+    pub fn table_merge_cells(
+        &mut self,
+        table: usize,
+        row: usize,
+        col: usize,
+        count: usize,
+    ) -> bool {
+        self.invalidate_layout();
+        if count < 2 {
+            return false;
+        }
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        let Some(r) = t.rows.get_mut(row) else {
+            return false;
+        };
+        if col + count > r.cells.len() {
+            return false;
+        }
+        for cell in &r.cells[col..col + count] {
+            if !cell.extra_xml.is_empty() {
+                return false;
+            }
+            if cell
+                .properties
+                .as_ref()
+                .is_some_and(|pr| pr.v_merge.is_some() || !pr.extra_xml.is_empty())
+            {
+                return false;
+            }
+        }
+        let span_total: u32 = r.cells[col..col + count]
+            .iter()
+            .map(|c| c.properties.as_ref().and_then(|pr| pr.grid_span).unwrap_or(1))
+            .sum();
+        let width_total = {
+            let widths: Vec<_> = r.cells[col..col + count]
+                .iter()
+                .map(|c| c.properties.as_ref().and_then(|pr| pr.width.clone()))
+                .collect();
+            if widths
+                .iter()
+                .all(|w| w.as_ref().is_some_and(|w| w.width_type == "dxa"))
+            {
+                let mut sum = widths[0].clone().unwrap();
+                sum.w = widths.iter().map(|w| w.as_ref().unwrap().w).sum();
+                Some(sum)
+            } else {
+                None
+            }
+        };
+        let merged: Vec<_> = r.cells.drain(col + 1..col + count).collect();
+        for cell in merged {
+            r.cells[col].content.extend(cell.content);
+        }
+        let target = &mut r.cells[col];
+        let pr = target.properties.get_or_insert_with(Default::default);
+        pr.grid_span = Some(span_total);
+        if let Some(w) = width_total {
+            pr.width = Some(w);
+        }
+        true
+    }
+
+    /// SVG PoC patch: split a horizontally merged cell back into its grid
+    /// columns: gridSpan returns to 1 and span - 1 empty cells (cloned
+    /// properties, width split evenly when present) are inserted after
+    /// it. Content stays in the first cell, like Word's split.
+    pub fn table_split_cell(&mut self, table: usize, row: usize, col: usize) -> bool {
+        self.invalidate_layout();
+        let Some(t) = self.plain_table_mut(table) else {
+            return false;
+        };
+        let Some(r) = t.rows.get_mut(row) else {
+            return false;
+        };
+        let Some(cell) = r.cells.get_mut(col) else {
+            return false;
+        };
+        if !cell.extra_xml.is_empty() {
+            return false;
+        }
+        let Some(pr) = cell.properties.as_mut() else {
+            return false;
+        };
+        let span = pr.grid_span.unwrap_or(1);
+        if span < 2 || pr.v_merge.is_some() || !pr.extra_xml.is_empty() {
+            return false;
+        }
+        pr.grid_span = None;
+        if let Some(w) = pr.width.as_mut() {
+            if w.width_type == "dxa" {
+                w.w /= span as i32;
+            }
+        }
+        let mut template = r.cells[col].clone();
+        template.content = vec![rdocx_oxml::table::CellContent::Paragraph(CT_P::new())];
+        template.extra_xml.clear();
+        for k in 0..(span - 1) as usize {
+            r.cells.insert(col + 1 + k, template.clone());
+        }
+        true
+    }
+
     /// SVG PoC patch: insert a copy of row `row` right after it in the
     /// top-level table at body index `table`. The clone keeps each cell's
     /// properties (widths, borders, shading) but resets the content to one
