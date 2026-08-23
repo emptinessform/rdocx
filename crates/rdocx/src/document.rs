@@ -3419,7 +3419,24 @@ impl Document {
         font_files: &[(&str, &[u8])],
         font_aliases: &[(&str, &str)],
     ) -> Result<rdocx_layout::WordLayoutResult> {
+        self.layout_with_fonts_aliases_options_and_bundled_fallback(
+            font_files,
+            font_aliases,
+            RenderOptions::default(),
+        )
+    }
+
+    /// Like [`Self::layout_with_fonts_aliases_and_bundled_fallback`], with
+    /// a selected revision view (e.g. Tracked to render both sides of
+    /// modeled revisions with decorations).
+    pub fn layout_with_fonts_aliases_options_and_bundled_fallback(
+        &self,
+        font_files: &[(&str, &[u8])],
+        font_aliases: &[(&str, &str)],
+        options: RenderOptions,
+    ) -> Result<rdocx_layout::WordLayoutResult> {
         let mut input = self.build_layout_input();
+        input.revision_view = options.revision_view;
         for (family, data) in font_files {
             input.fonts.push(rdocx_layout::FontFile {
                 family: family.to_string(),
