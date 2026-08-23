@@ -3414,6 +3414,19 @@ impl Document {
         &self,
         font_files: &[(&str, &[u8])],
     ) -> Result<rdocx_layout::WordLayoutResult> {
+        self.layout_with_fonts_aliases_and_bundled_fallback(font_files, &[])
+    }
+
+    /// Like [`Self::layout_with_fonts_and_bundled_fallback`], plus
+    /// requested-name -> family font aliases. Aliases carry no font bytes:
+    /// a caller can register one open font and point many document-facing
+    /// family names (e.g. \u{bc14}\u{d0d5}, \u{ad74}\u{b9bc}) at it without duplicating data
+    /// on every layout.
+    pub fn layout_with_fonts_aliases_and_bundled_fallback(
+        &self,
+        font_files: &[(&str, &[u8])],
+        font_aliases: &[(&str, &str)],
+    ) -> Result<rdocx_layout::WordLayoutResult> {
         let mut input = self.build_layout_input();
         for (family, data) in font_files {
             input.fonts.push(rdocx_layout::FontFile {
@@ -3432,6 +3445,12 @@ impl Document {
                 engine.as_mut().expect("just inserted")
             }
         };
+        engine.set_caller_font_aliases(
+            font_aliases
+                .iter()
+                .map(|(requested, target)| (requested.to_string(), target.to_string()))
+                .collect(),
+        );
         Ok(rdocx_layout::layout_document_with_fallback_fonts_engine(
             engine, &input,
         )?)

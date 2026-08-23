@@ -421,6 +421,9 @@ pub struct Engine {
     subst_prev: Vec<(std::sync::Arc<PageFrame>, std::sync::Arc<PageFrame>)>,
     /// Field environment of `subst_prev`: total pages + bookmark targets.
     subst_env: u64,
+    /// Requested-name -> family aliases forwarded to the font manager on
+    /// every layout (no bytes; see FontManager::set_caller_aliases).
+    caller_font_aliases: Vec<(String, String)>,
 }
 
 /// A laid-out table plus what a cache hit must replay, mirroring
@@ -523,7 +526,16 @@ impl Engine {
             hf_cache: HashMap::new(),
             subst_prev: Vec::new(),
             subst_env: 0,
+            caller_font_aliases: Vec::new(),
         }
+    }
+
+    /// Set the requested-name -> family font aliases consulted during
+    /// resolution. Carries no font bytes, so passing a large mapping every
+    /// layout is cheap; a change invalidates font-derived caches on the
+    /// next layout.
+    pub fn set_caller_font_aliases(&mut self, aliases: Vec<(String, String)>) {
+        self.caller_font_aliases = aliases;
     }
 
     pub fn new() -> Self {
@@ -563,7 +575,10 @@ impl Engine {
     ) -> Result<LayoutResult> {
         // Load user-provided / DOCX-embedded fonts (highest priority). An exact
         // unchanged set is a no-op in a reusable engine.
-        let fonts_changed = self.font_manager.load_additional_fonts(&input.fonts);
+        let fonts_changed = self.font_manager.load_additional_fonts(&input.fonts)
+            | self
+                .font_manager
+                .set_caller_aliases(&self.caller_font_aliases);
         self.font_manager.begin_layout();
 
         let paragraph_context = ParagraphCacheContext::for_input(input);
