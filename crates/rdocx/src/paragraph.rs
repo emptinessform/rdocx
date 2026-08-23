@@ -1265,6 +1265,42 @@ impl<'a> ParagraphRef<'a> {
             .collect()
     }
 
+    /// Comment anchor ranges as (comment id, char_start, char_end).
+    ///
+    /// Range markers sit at run boundaries; this converts them to
+    /// character offsets. An unmatched start closes at the paragraph end
+    /// and an unmatched end opens at 0 (cross-paragraph comments appear
+    /// clamped to each paragraph).
+    pub fn comment_spans(&self) -> Vec<(i32, usize, usize)> {
+        use rdocx_oxml::text::CommentRangeMarker;
+        let mut run_offsets = Vec::with_capacity(self.inner.runs.len() + 1);
+        let mut acc = 0usize;
+        run_offsets.push(0);
+        for r in &self.inner.runs {
+            acc += r.text().chars().count();
+            run_offsets.push(acc);
+        }
+        let off = |run_index: usize| *run_offsets.get(run_index).unwrap_or(&acc);
+        let mut starts: std::collections::HashMap<i32, usize> = Default::default();
+        let mut out = Vec::new();
+        for marker in &self.inner.comment_ranges {
+            match marker {
+                CommentRangeMarker::Start { id, run_index, .. } => {
+                    starts.insert(*id, off(*run_index));
+                }
+                CommentRangeMarker::End { id, run_index, .. } => {
+                    let s = starts.remove(id).unwrap_or(0);
+                    out.push((*id, s, off(*run_index)));
+                }
+            }
+        }
+        for (id, s) in starts {
+            out.push((id, s, acc));
+        }
+        out.sort();
+        out
+    }
+
     /// Get list numbering as (num_id, level) if this paragraph is a list
     /// item. Resolve bullet-vs-numbered via `Document::numbering_is_bullet`.
     pub fn numbering(&self) -> Option<(u32, u32)> {
