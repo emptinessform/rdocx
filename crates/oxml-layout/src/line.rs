@@ -822,7 +822,7 @@ fn inline_to_line_item(
             structure_id,
         } => LineItem::Figure {
             item: Box::new(inline_to_line_item(
-                item, current_x, tab_stops, fm, font_ctx,
+                item, current_x, tab_stops, default_tab_interval, fm, font_ctx,
             )),
             alternate_text: alternate_text.clone(),
             structure_id: *structure_id,

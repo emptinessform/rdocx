@@ -1,11 +1,13 @@
 //! Conversion from WordprocessingML flow values to shared layout values.
 
 use oxml_layout::{
-    Align, LayoutLine, LineBreakParams, LineSpacing, TabAlign, TabLeader, TabStop, Underline,
+    Align, InlineItem, LayoutLine, LineBreakParams, LineSpacing, TabAlign, TabLeader, TabStop,
+    TextSegment, Underline,
 };
 use rdocx_oxml::borders::CT_TabStop;
 use rdocx_oxml::properties::CT_PPr;
 use rdocx_oxml::shared::{ST_Jc, ST_TabJc, ST_TabLeader, ST_Underline};
+use unicode_linebreak::linebreaks;
 
 pub(crate) fn alignment(value: Option<ST_Jc>) -> Option<Align> {
     value.map(|value| match value {
@@ -134,6 +136,52 @@ pub(crate) fn text_segments(segment: TextSegment, hangul_word_wrap: bool) -> Vec
         .into_iter()
         .map(|(start, end)| InlineItem::Text(slice_text_segment(&segment, start, end)))
         .collect()
+}
+
+fn slice_text_segment(segment: &TextSegment, byte_start: usize, byte_end: usize) -> TextSegment {
+    if byte_start == 0 && byte_end == segment.text.len() {
+        return segment.clone();
+    }
+
+    let text = segment.text[byte_start..byte_end].to_string();
+    let total_chars = segment.text.chars().count();
+    let char_start = segment.text[..byte_start].chars().count();
+    let char_count = text.chars().count();
+    let (glyph_ids, advances) = if segment.glyph_ids.len() == total_chars {
+        let end = (char_start + char_count).min(segment.glyph_ids.len());
+        (
+            segment.glyph_ids[char_start..end].to_vec(),
+            segment.advances[char_start..end].to_vec(),
+        )
+    } else if segment.glyph_ids.is_empty() || segment.text.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let byte_fraction = (byte_end - byte_start) as f64 / segment.text.len() as f64;
+        let glyph_count = (segment.glyph_ids.len() as f64 * byte_fraction).round() as usize;
+        let glyph_start = (segment.glyph_ids.len() as f64 * byte_start as f64
+            / segment.text.len() as f64)
+            .round() as usize;
+        let glyph_end = (glyph_start + glyph_count).min(segment.glyph_ids.len());
+        (
+            segment.glyph_ids[glyph_start..glyph_end].to_vec(),
+            segment.advances[glyph_start..glyph_end].to_vec(),
+        )
+    };
+    let width = advances.iter().sum();
+    let source = segment.source.map(|source| oxml_layout::SourceSpan {
+        node: source.node,
+        char_start: source.char_start + char_start as u32,
+        char_end: source.char_start + (char_start + char_count) as u32,
+    });
+
+    TextSegment {
+        text,
+        source,
+        glyph_ids,
+        advances,
+        width,
+        ..segment.clone()
+    }
 }
 
 pub(crate) fn restore_word_line_heights(lines: &mut [LayoutLine], properties: &CT_PPr) {

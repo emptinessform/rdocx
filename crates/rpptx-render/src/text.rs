@@ -668,6 +668,8 @@ fn line_break_params(
         },
         jc: Some(paragraph_align(paragraph.alignment)),
         wrap,
+        default_tab_interval_pt: 36.0,
+        hangul_word_wrap: false,
     }
 }
 

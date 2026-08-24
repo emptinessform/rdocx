@@ -3586,7 +3586,7 @@ fn layout_paragraph_with_source_and_table(
                         shaped.width += extra * shaped.advances.len() as f64;
                     }
 
-                    inline_items.push(InlineItem::Text(TextSegment {
+                    inline_items.extend(convert::text_segments(TextSegment {
                         text,
                         source,
                         font_id,
@@ -3793,7 +3793,7 @@ fn layout_paragraph_with_source_and_table(
                                     }
                                     shaped.width += extra * shaped.advances.len() as f64;
                                 }
-                                inline_items.push(InlineItem::Text(TextSegment {
+                                inline_items.extend(convert::text_segments(TextSegment {
                                     text,
                                     source: None,
                                     font_id: segment_font_id,

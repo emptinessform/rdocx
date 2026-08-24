@@ -21,6 +21,7 @@ default = ["system-fonts"]
 system-fonts = ["oxml-layout/system-fonts"]
 
 [dependencies]
+unicode-linebreak = { workspace = true }
 oxml-chart = { workspace = true }
 oxml-drawing = { workspace = true }
 oxml-layout = { workspace = true, default-features = false }
