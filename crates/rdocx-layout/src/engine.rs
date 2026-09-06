@@ -765,28 +765,34 @@ enum RestartBodyEntry {
 
 impl RestartBodyEntry {
     fn matches(&self, content: &BodyContent) -> bool {
+        self.matches_with_identity(content, restart_body_identity(content).as_deref())
+    }
+
+    /// `matches` with the candidate's identity supplied, so the three scans
+    /// over the body can serialize each block once instead of once per scan.
+    fn matches_with_identity(&self, content: &BodyContent, identity: Option<&[u8]>) -> bool {
         match (self, content) {
             (
                 Self::Paragraph {
                     fingerprint,
-                    identity,
+                    identity: retained,
                     ..
                 },
                 BodyContent::Paragraph(paragraph),
             ) => {
                 *fingerprint == paragraph_fingerprint(paragraph)
-                    && restart_body_identity(content).as_ref() == Some(identity)
+                    && identity == Some(retained.as_slice())
             }
             (
                 Self::Table {
                     fingerprint,
-                    identity,
+                    identity: retained,
                     ..
                 },
                 BodyContent::Table(table),
             ) => {
                 *fingerprint == table_fingerprint(table)
-                    && restart_body_identity(content).as_ref() == Some(identity)
+                    && identity == Some(retained.as_slice())
             }
             _ => false,
         }
@@ -832,6 +838,32 @@ impl RestartBodyEntry {
             } => note_references,
             Self::Table { .. } => &[],
         }
+    }
+}
+
+/// Lazily computed `restart_body_identity` per body block.
+///
+/// The prefix scan runs twice (`body_unchanged`, then `first_changed`) and the
+/// suffix scan once, so without this a mid-document keystroke serialized about
+/// 1.5 blocks of XML per body block. Each block is now serialized at most once
+/// per layout.
+struct BodyIdentities<'a> {
+    content: &'a [BodyContent],
+    identities: Vec<Option<Option<Vec<u8>>>>,
+}
+
+impl<'a> BodyIdentities<'a> {
+    fn new(content: &'a [BodyContent]) -> Self {
+        Self {
+            identities: vec![None; content.len()],
+            content,
+        }
+    }
+
+    fn get(&mut self, index: usize) -> Option<&[u8]> {
+        self.identities[index]
+            .get_or_insert_with(|| restart_body_identity(&self.content[index]))
+            .as_deref()
     }
 }
 
@@ -1474,40 +1506,43 @@ impl Engine {
                     && (sources.is_none() || cache.body.len() == input.document.body.content.len())
             });
         let reusable_restart = restart_eligible && reusable_restart_record;
-        let body_unchanged = reusable_restart_record
-            && self.restart_cache.as_ref().is_some_and(|cache| {
-                cache.body.len() == input.document.body.content.len()
-                    && input
-                        .document
-                        .body
-                        .content
-                        .iter()
-                        .zip(&cache.body)
-                        .all(|(content, retained)| retained.matches(content))
+        // One identity memo across all three scans: they overlap almost
+        // completely, and serializing a block to XML is the expensive part.
+        let (body_unchanged, first_changed, common_suffix) = {
+            let content = &input.document.body.content;
+            let mut identities = BodyIdentities::new(content);
+            let retained = self
+                .restart_cache
+                .as_ref()
+                .map(|cache| cache.body.as_slice());
+            let retained_len = retained.map_or(0, <[RestartBodyEntry]>::len);
+            let scan_len = retained_len.min(content.len());
+            let mut matches_at = |identities: &mut BodyIdentities, index: usize| {
+                retained.is_some_and(|body| {
+                    body[index].matches_with_identity(&content[index], identities.get(index))
+                })
+            };
+            let body_unchanged = reusable_restart_record
+                && retained_len == content.len()
+                && (0..scan_len).all(|index| matches_at(&mut identities, index));
+            let first_changed = reusable_restart.then(|| {
+                (0..scan_len)
+                    .position(|index| !matches_at(&mut identities, index))
+                    .unwrap_or(scan_len)
             });
-        let first_changed = reusable_restart.then(|| {
-            let cache = self.restart_cache.as_ref().expect("restart cache exists");
-            input
-                .document
-                .body
-                .content
-                .iter()
-                .zip(&cache.body)
-                .position(|(current, previous)| !previous.matches(current))
-                .unwrap_or_else(|| input.document.body.content.len().min(cache.body.len()))
-        });
-        let common_suffix = reusable_restart.then(|| {
-            let cache = self.restart_cache.as_ref().expect("restart cache exists");
-            input
-                .document
-                .body
-                .content
-                .iter()
-                .rev()
-                .zip(cache.body.iter().rev())
-                .take_while(|(current, previous)| previous.matches(current))
-                .count()
-        });
+            let common_suffix = reusable_restart.then(|| {
+                (0..scan_len)
+                    .take_while(|offset| {
+                        let index = content.len() - 1 - offset;
+                        retained.is_some_and(|body| {
+                            body[retained_len - 1 - offset]
+                                .matches_with_identity(&content[index], identities.get(index))
+                        })
+                    })
+                    .count()
+            });
+            (body_unchanged, first_changed, common_suffix)
+        };
         let restart_checkpoint = first_changed.and_then(|first_changed| {
             self.restart_cache
                 .as_ref()
