@@ -1503,7 +1503,6 @@ impl Engine {
                         .iter()
                         .flat_map(|entry| entry.note_references().iter().copied())
                         .eq(body_note_references(input))
-                    && (sources.is_none() || cache.body.len() == input.document.body.content.len())
             });
         let reusable_restart = restart_eligible && reusable_restart_record;
         // One identity memo across all three scans: they overlap almost
@@ -11439,6 +11438,56 @@ mod tests {
                 "aggregate pressure {occupied} must reject the candidate"
             );
         }
+    }
+
+    #[test]
+    fn sourced_insert_and_delete_restart_instead_of_repaginating() {
+        // SVG PoC patch: with provenance on, a body-length change used to
+        // disqualify the restart record outright, so every Enter, merge and
+        // selection delete re-paginated the whole document. The reused tail
+        // pages carry their own source spans, so the check that matters is
+        // that a warm restart is element-for-element equal to a fresh layout,
+        // source spans included, while recomputing only a few pages.
+        let mut input = ordinary_prose_restart_input(700);
+        let mut engine = Engine::new_deterministic().expect("bundled fonts load");
+        let (primed, primed_sources) = engine
+            .layout_with_provenance(&input)
+            .expect("prime sourced restart state");
+        assert!(engine.restart_cache.is_some());
+
+        let mut inserted = CT_P::new();
+        inserted.add_run("ordinary inserted paragraph");
+        input
+            .document
+            .body
+            .content
+            .insert(640, BodyContent::Paragraph(inserted));
+        let (warm_insert, warm_insert_sources) = engine
+            .layout_with_provenance(&input)
+            .expect("warm sourced insertion");
+        assert!(
+            engine.page_layout_invocation_count() <= 3,
+            "sourced insertion recomputed {} pages",
+            engine.page_layout_invocation_count()
+        );
+        let (fresh_insert, fresh_insert_sources) = Engine::new_deterministic()
+            .expect("bundled fonts load")
+            .layout_with_provenance(&input)
+            .expect("fresh sourced insertion");
+        assert_layout_results_equal(&warm_insert, &fresh_insert);
+        assert_eq!(warm_insert_sources, fresh_insert_sources);
+
+        input.document.body.content.remove(640);
+        let (warm_delete, warm_delete_sources) = engine
+            .layout_with_provenance(&input)
+            .expect("warm sourced deletion");
+        assert!(
+            engine.page_layout_invocation_count() <= 3,
+            "sourced deletion recomputed {} pages",
+            engine.page_layout_invocation_count()
+        );
+        assert_layout_results_equal(&warm_delete, &primed);
+        assert_eq!(warm_delete_sources, primed_sources);
     }
 
     #[test]
