@@ -4755,8 +4755,6 @@ fn layout_paragraph_with_source_and_table(
     }
 
     // Convert paragraph properties to layout values
-    let hangul_word_wrap =
-        effective_ppr.line_rule.as_deref() == Some("font-natural");
     let space_before = effective_ppr.space_before.map(|t| t.to_pt()).unwrap_or(0.0);
     let space_after = effective_ppr.space_after.map(|t| t.to_pt()).unwrap_or(0.0);
     let base_direction = match effective_ppr.bidi {
