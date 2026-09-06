@@ -790,10 +790,7 @@ impl RestartBodyEntry {
                     ..
                 },
                 BodyContent::Table(table),
-            ) => {
-                *fingerprint == table_fingerprint(table)
-                    && identity == Some(retained.as_slice())
-            }
+            ) => *fingerprint == table_fingerprint(table) && identity == Some(retained.as_slice()),
             _ => false,
         }
     }
@@ -1552,37 +1549,49 @@ impl Engine {
                 .find(|checkpoint| checkpoint.next_block_index <= first_changed)
                 .copied()
         });
-        let tail_source = restart_checkpoint.and_then(|restart| {
-            let cache = self.restart_cache.as_ref().expect("restart cache exists");
-            let common_suffix = common_suffix.expect("reusable restart has an exact suffix");
-            let new_tail = input.document.body.content.len() - common_suffix;
-            let old_tail = cache.body.len() - common_suffix;
-            let block_delta = new_tail as isize - old_tail as isize;
-            cache
-                .checkpoints
-                .iter()
-                .find(|checkpoint| {
-                    checkpoint.next_block_index >= old_tail
-                        && checkpoint
-                            .next_block_index
-                            .checked_add_signed(block_delta)
-                            .is_some_and(|next| next > restart.next_block_index)
-                })
-                .copied()
-                .map(|old| {
-                    (
-                        paginator::PaginationCheckpoint {
-                            next_block_index: old
+        // The retained tail pages are reused verbatim, and a body-level
+        // WordSourcePath is its own body index, so a length change shifts
+        // every source node after the edit. Restarting at the first changed
+        // block is still safe - those indices did not move - but the tail
+        // can only be reused when the body length is unchanged.
+        let tail_reusable = sources.is_none()
+            || self
+                .restart_cache
+                .as_ref()
+                .is_some_and(|cache| cache.body.len() == input.document.body.content.len());
+        let tail_source = restart_checkpoint
+            .filter(|_| tail_reusable)
+            .and_then(|restart| {
+                let cache = self.restart_cache.as_ref().expect("restart cache exists");
+                let common_suffix = common_suffix.expect("reusable restart has an exact suffix");
+                let new_tail = input.document.body.content.len() - common_suffix;
+                let old_tail = cache.body.len() - common_suffix;
+                let block_delta = new_tail as isize - old_tail as isize;
+                cache
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| {
+                        checkpoint.next_block_index >= old_tail
+                            && checkpoint
                                 .next_block_index
                                 .checked_add_signed(block_delta)
-                                .expect("common suffix block index remains in range"),
-                            page_count: old.page_count,
-                            next_header_page_number: old.next_header_page_number,
-                        },
-                        old,
-                    )
-                })
-        });
+                                .is_some_and(|next| next > restart.next_block_index)
+                    })
+                    .copied()
+                    .map(|old| {
+                        (
+                            paginator::PaginationCheckpoint {
+                                next_block_index: old
+                                    .next_block_index
+                                    .checked_add_signed(block_delta)
+                                    .expect("common suffix block index remains in range"),
+                                page_count: old.page_count,
+                                next_header_page_number: old.next_header_page_number,
+                            },
+                            old,
+                        )
+                    })
+            });
 
         let (mut pages, mut outlines, mut checkpoints) = if restart_eligible {
             let mut recorded = paginator::paginate_shared_single_section_recorded(
