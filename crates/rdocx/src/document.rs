@@ -1834,6 +1834,25 @@ impl Document {
         }
     }
 
+    /// SVG PoC patch: hand the bundled-fallback engine (and its content-keyed
+    /// relayout caches) to a caller restoring an undo snapshot, so the
+    /// rebuilt Document does not go cache-cold. Interim shape until the
+    /// upstream F-X039 session/handle design lands.
+    pub fn take_layout_engine(&self) -> Option<rdocx_layout::engine::Engine> {
+        self.bundled_fallback_layout_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// SVG PoC patch: counterpart of [`Self::take_layout_engine`].
+    pub fn set_layout_engine(&self, engine: rdocx_layout::engine::Engine) {
+        *self
+            .bundled_fallback_layout_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine);
+    }
+
     /// Commit staged package state without discarding reusable layout work.
     pub(crate) fn commit_staged_mutation(&mut self, mut candidate: Self) {
         std::mem::swap(
