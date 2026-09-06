@@ -444,6 +444,13 @@ pub struct Engine {
     #[cfg(test)]
     pending_paragraph_cache_peak_bytes: usize,
     paragraph_cache_reads_enabled: bool,
+    /// Whether the retained note parts match this layout's input. A body
+    /// paragraph that carries a note reference is only served from the cache
+    /// when this holds; one that carries none is served either way.
+    paragraph_cache_notes_match: bool,
+    /// The full retained-context match, notes included. The restart record
+    /// covers note pages, so it keeps the strict gate.
+    retained_context_matches_full: bool,
     table_cache: VecDeque<TableCacheEntry>,
     table_cache_bytes: usize,
     table_cache_hits: usize,
@@ -597,7 +604,31 @@ impl ReusableEngineContext {
             && retained_context_fonts_match(&self.fonts, &input.fonts)
     }
 
+    /// Whether the retained note parts still match the input.
+    ///
+    /// Split out from the rest of the context so a note-part edit can keep
+    /// serving cached body paragraphs that carry no note reference. A body
+    /// paragraph's layout never reads the note part: a reference renders its
+    /// marker from `id.to_string()`, and the note text is laid out separately
+    /// into note pages.
+    fn notes_match(&self, input: &LayoutInput) -> bool {
+        self.footnotes == input.footnotes && self.endnotes == input.endnotes
+    }
+
     fn matches_input_after_unchanged_fonts(
+        &self,
+        input: &LayoutInput,
+        caller_font_aliases: &[(String, String)],
+        has_wrapping_drawing: bool,
+    ) -> bool {
+        self.matches_input_after_unchanged_fonts_ignoring_notes(
+            input,
+            caller_font_aliases,
+            has_wrapping_drawing,
+        ) && self.notes_match(input)
+    }
+
+    fn matches_input_after_unchanged_fonts_ignoring_notes(
         &self,
         input: &LayoutInput,
         caller_font_aliases: &[(String, String)],
@@ -632,8 +663,6 @@ impl ReusableEngineContext {
             && self.chart_color_map == input.chart_color_map
             && self.core_properties == input.core_properties
             && self.hyperlink_urls == input.hyperlink_urls
-            && self.footnotes == input.footnotes
-            && self.endnotes == input.endnotes
             && self.theme == input.theme
             && self.caller_font_aliases == caller_font_aliases
             && self.background_xml == input.document.background_xml
@@ -951,6 +980,8 @@ impl Engine {
             #[cfg(test)]
             pending_paragraph_cache_peak_bytes: 0,
             paragraph_cache_reads_enabled: false,
+            paragraph_cache_notes_match: false,
+            retained_context_matches_full: false,
             table_cache: VecDeque::new(),
             table_cache_bytes: 0,
             table_cache_hits: 0,
@@ -1081,18 +1112,31 @@ impl Engine {
             self.header_footer_cache.clear();
             self.header_footer_cache_bytes = 0;
         }
-        let context_matches = !font_context_changed
+        // The note parts are checked separately from the rest of the context.
+        // A note-part edit invalidates only what actually reads it: the note
+        // pages, the restart record that covers them, and the paragraphs that
+        // carry a note reference. Every other body paragraph keeps its cached
+        // layout, which is the difference between re-laying out one paragraph
+        // and re-laying out the document.
+        let base_matches = !font_context_changed
             && self
                 .paragraph_cache_context
                 .as_ref()
                 .is_some_and(|context| {
-                    context.matches_input_after_unchanged_fonts(
+                    context.matches_input_after_unchanged_fonts_ignoring_notes(
                         input,
                         &self.caller_font_aliases,
                         has_wrapping_drawing,
                     )
                 });
-        self.paragraph_cache_reads_enabled = context_matches;
+        let notes_match = self
+            .paragraph_cache_context
+            .as_ref()
+            .is_some_and(|context| context.notes_match(input));
+        let context_matches = base_matches && notes_match;
+        self.paragraph_cache_reads_enabled = base_matches;
+        self.paragraph_cache_notes_match = notes_match;
+        self.retained_context_matches_full = context_matches;
         self.header_footer_cache_reads_enabled = context_matches;
         self.pending_paragraph_cache = Some(VecDeque::new());
         self.pending_paragraph_cache_bytes = 0;
@@ -1189,7 +1233,7 @@ impl Engine {
         sources: Option<&SourceRegistry>,
         document_wraps: bool,
     ) -> Result<LayoutResult> {
-        let retained_context_matches = self.paragraph_cache_reads_enabled;
+        let retained_context_matches = self.retained_context_matches_full;
         let styles = &input.styles;
         let mut num_state = NumberingState::new();
         let media = MediaRegistry::new(&input.images);
@@ -1909,7 +1953,12 @@ impl Engine {
         }
 
         let fingerprint = paragraph_fingerprint(paragraph);
+        // A paragraph with a note reference is only reusable while the note
+        // parts are unchanged; one without cannot depend on them.
+        let notes_allow_reuse =
+            self.paragraph_cache_notes_match || !paragraph_has_note_reference(paragraph);
         if self.paragraph_cache_reads_enabled
+            && notes_allow_reuse
             && let Some(entry) = self.paragraph_cache.iter().find(|entry| {
                 entry.fingerprint == fingerprint
                     && entry.key.paragraph == *paragraph
@@ -9594,7 +9643,11 @@ mod tests {
             .layout(&input)
             .expect("fresh changed note layout succeeds");
         assert_layout_results_equal(&warm_note, &fresh_note);
-        assert_eq!(engine.paragraph_cache_counts(), (699, 1_401));
+        // SVG PoC patch: a note-part edit no longer invalidates the whole
+        // paragraph cache, only the paragraphs that carry a note reference.
+        // Upstream rebuilds all 700 here (699, 1_401); the warm/fresh equality
+        // above is the contract and it still holds.
+        assert_eq!(engine.paragraph_cache_counts(), (1_398, 702));
     }
 
     #[test]
