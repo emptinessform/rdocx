@@ -745,6 +745,7 @@ mod group_output_tests {
                 face_index: 0,
                 bold: false,
                 italic: false,
+                synthetic_italic: false,
             }],
             None,
             Vec::new(),

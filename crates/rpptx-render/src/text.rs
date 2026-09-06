@@ -789,6 +789,8 @@ fn line_break_params(
         (paragraph.indent, 0.0)
     };
     LineBreakParams {
+        default_tab_interval_pt: 36.0,
+        hangul_word_wrap: false,
         // Slide text has nothing floating beside it to flow around.
         line_prefix_widths: Vec::new(),
         line_suffix_widths: Vec::new(),

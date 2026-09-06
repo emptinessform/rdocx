@@ -5521,6 +5521,7 @@ fn layout_paragraph_with_source_and_table(
         {
             line.items.push(LineItem::Text(TextSegment {
                 text: String::new(),
+                direction: TextDirection::Auto,
                 source: source_node.map(|node| oxml_layout::SourceSpan {
                     node,
                     char_start: 0,

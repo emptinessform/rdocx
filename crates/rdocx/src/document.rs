@@ -3876,7 +3876,7 @@ impl Document {
         let existing = numbering.nums.iter().find(|n| {
             numbering
                 .get_abstract_num_for(n.num_id)
-                .map(|a| a.levels.first().and_then(|l| l.num_fmt) == Some(want))
+                .map(|a| a.levels.first().and_then(|l| l.num_fmt.as_ref()) == Some(&want))
                 .unwrap_or(false)
         });
         if let Some(existing) = existing {

@@ -371,7 +371,7 @@ pub fn break_into_lines(
                 // at the margin — LibreOffice, Word, and CSS all agree), so
                 // the fit test discounts it. The full width still accrues to
                 // the line so inter-word spacing stays intact mid-line.
-                let fit_width = seg_width - trailing_whitespace_width(seg_items);
+                let fit_width = seg_width - trailing_whitespace_width(&seg_items);
 
                 if params.wrap
                     && !current_items.is_empty()
@@ -416,7 +416,7 @@ pub fn break_into_lines(
                 // Word's 36pt default interval the two mistakes cancelled
                 // exactly, which is why this only surfaced with other
                 // intervals.
-                for item in seg_items {
+                for item in &seg_items {
                     let (w, a, d, natural_height, font_size) = item_metrics(item);
                     if a > current_ascent {
                         current_ascent = a;
@@ -467,6 +467,7 @@ pub fn break_into_lines(
                         &item,
                         current_width,
                         &params.tab_stops,
+                        params.default_tab_interval_pt,
                         fm,
                         font_ctx,
                     ));
@@ -493,6 +494,7 @@ pub fn break_into_lines(
                             &item,
                             current_width,
                             &params.tab_stops,
+                            params.default_tab_interval_pt,
                             fm,
                             font_ctx,
                         ));
@@ -580,6 +582,7 @@ pub fn break_into_lines(
                         &item,
                         current_width,
                         &params.tab_stops,
+                        params.default_tab_interval_pt,
                         fm,
                         font_ctx,
                     ));
@@ -1357,7 +1360,12 @@ fn inline_to_line_item(
             structure_id,
         } => LineItem::Figure {
             item: Box::new(inline_to_line_item(
-                item, current_x, tab_stops, fm, font_ctx,
+                item,
+                current_x,
+                tab_stops,
+                default_tab_interval,
+                fm,
+                font_ctx,
             )),
             alternate_text: alternate_text.clone(),
             structure_id: *structure_id,
@@ -2198,6 +2206,8 @@ mod tests {
             wrap: true,
             line_prefix_widths: Vec::new(),
             line_suffix_widths: Vec::new(),
+            default_tab_interval_pt: 36.0,
+            hangul_word_wrap: false,
         };
         let _shaped = crate::ShapedText {
             glyph_ids: segment.glyph_ids.clone(),

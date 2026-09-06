@@ -369,6 +369,8 @@ impl<'a> Paragraph<'a> {
         let mut run = CT_R::new("");
         run.content = vec![RunContent::Drawing(drawing)];
         self.inner.runs.push(run);
+    }
+
     /// Wrap the EXISTING runs [run_start, run_end) in an external
     /// hyperlink relationship — for editors linking selected text (pair
     /// with [`crate::Document::add_hyperlink_relationship`]).
@@ -395,6 +397,8 @@ impl<'a> Paragraph<'a> {
         self.inner.hyperlinks.push(HyperlinkSpan {
             rel_id: Some(relationship_id.to_string()),
             anchor: None,
+            tooltip: None,
+            doc_location: None,
             run_start,
             run_end,
             extra_attributes: Vec::new(),

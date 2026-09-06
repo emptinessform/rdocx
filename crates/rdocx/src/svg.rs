@@ -1083,7 +1083,8 @@ mod tests {
             ),
             face_index: 0,
             bold: false,
-            italic: false,
+            italic: false,            synthetic_italic: false,
+
         }
     }
 
