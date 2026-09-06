@@ -1519,7 +1519,6 @@ dependencies = [
  "oxml-drawing",
  "oxml-layout",
  "rdocx-oxml",
- "unicode-linebreak",
 ]
 
 [[package]]

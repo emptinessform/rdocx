@@ -5071,17 +5071,7 @@ fn layout_paragraph_with_source_and_table(
                             language: language.clone(),
                         });
                     } else {
-                        // 어절 단위 모드에서는 한 세그먼트가 여러 아이템으로
-                        // 쪼개지므로, 다국어 스타일을 추가 인덱스에도 복제한다.
-                        let style = multilingual_styles[&item_index].clone();
-                        for (offset, item) in
-                            convert::text_segments(segment, hangul_word_wrap).into_iter().enumerate()
-                        {
-                            if offset > 0 {
-                                multilingual_styles.insert(item_index + offset, style.clone());
-                            }
-                            inline_items.push(item);
-                        }
+                        inline_items.push(InlineItem::Text(segment));
                     }
                 }
                 RunContent::Tab => {
@@ -5280,8 +5270,7 @@ fn layout_paragraph_with_source_and_table(
                                             .map_or(0.0, |value| value.to_pt()),
                                     },
                                 );
-                                let style = multilingual_styles[&item_index].clone();
-                                for (offset, item) in convert::text_segments(TextSegment {
+                                inline_items.push(InlineItem::Text(TextSegment {
                                     text,
                                     direction: word_text_direction(segment_rpr.rtl),
                                     source: None,
@@ -5304,16 +5293,7 @@ fn layout_paragraph_with_source_and_table(
                                     hyperlink_url: current_hyperlink_url.clone(),
                                     field_kind,
                                     note: None,
-                                }, hangul_word_wrap)
-                                .into_iter()
-                                .enumerate()
-                                {
-                                    if offset > 0 {
-                                        multilingual_styles
-                                            .insert(item_index + offset, style.clone());
-                                    }
-                                    inline_items.push(item);
-                                }
+                                }));
                             }
                             if let Some(control) = control {
                                 inline_items.push(control);
@@ -15004,7 +14984,18 @@ mod tests {
             let PositionedElement::Text(run) = element else {
                 continue;
             };
-            let right = run.origin.x + run.advances.iter().sum::<f64>();
+            // Trailing whitespace at a wrapped line end may hang into the
+            // margin (it has no ink) — measure the reach of visible text,
+            // the same rule the footnote margin guard uses.
+            let ws_count = run
+                .text
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .count()
+                .min(run.advances.len());
+            let ink = run.advances.len() - ws_count;
+            let right = run.origin.x + run.advances[..ink].iter().sum::<f64>();
             if let Some(entry) = by_line
                 .iter_mut()
                 .find(|(y, _, _)| (*y - run.origin.y).abs() < 0.01)
